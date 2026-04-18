@@ -697,7 +697,8 @@ public class RackBuilderCore : MelonMod
 			for (int s = 0; s < num; s++)
 			{
 				RackPosition rp0 = ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions)[s];
-				if ((UnityEngine.Object)(object)rp0 != (UnityEngine.Object)null)
+				// Skip UID=0 — unassigned positions must never match unplaced objects (rackPositionUID default is also 0)
+				if ((UnityEngine.Object)(object)rp0 != (UnityEngine.Object)null && rp0.rackPosGlobalUID != 0)
 					rpUidToSlot[rp0.rackPosGlobalUID] = s;
 			}
 		}
@@ -784,6 +785,7 @@ public class RackBuilderCore : MelonMod
 				foreach (UsableObject uo in (Il2CppArrayBase<UsableObject>)(object)broadUos)
 				{
 					if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
+					if (uo.rackPositionUID == 0) continue; // unplaced object — skip
 					int slot = -1;
 					if (rpUidToSlot.TryGetValue(uo.rackPositionUID, out int mapped1))
 						slot = mapped1;
@@ -810,6 +812,7 @@ public class RackBuilderCore : MelonMod
 			foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
 			{
 				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
+				if (uo.rackPositionUID == 0) continue; // unplaced object — skip
 				if (!rpUidToSlot.TryGetValue(uo.rackPositionUID, out int slot)) continue;
 				if (slotsFound.Contains(slot)) continue;
 				string label2 = DescribeUsableObject(uo);
@@ -836,6 +839,7 @@ public class RackBuilderCore : MelonMod
 			{
 				if ((UnityEngine.Object)(object)srv2 == (UnityEngine.Object)null) continue;
 				UsableObject uoSrv = (UsableObject)(object)srv2;
+				if (uoSrv.rackPositionUID == 0) continue;
 				if (!rpUidToSlot.TryGetValue(uoSrv.rackPositionUID, out int slot)) continue;
 				if (slotsFound.Contains(slot)) continue;
 				int size2 = (uoSrv.sizeInU > 0) ? uoSrv.sizeInU : 3;
@@ -848,6 +852,7 @@ public class RackBuilderCore : MelonMod
 			{
 				if ((UnityEngine.Object)(object)sw2 == (UnityEngine.Object)null) continue;
 				UsableObject uoSw = (UsableObject)(object)sw2;
+				if (uoSw.rackPositionUID == 0) continue;
 				if (!rpUidToSlot.TryGetValue(uoSw.rackPositionUID, out int slot)) continue;
 				if (slotsFound.Contains(slot)) continue;
 				string label2 = sw2.isBroken ? "Switch BROKEN" : (sw2.isOn ? "Switch [ON]" : "Switch [OFF]");
@@ -2126,6 +2131,14 @@ public class RackBuilderCore : MelonMod
 				if ((UnityEngine.Object)(object)val4 == (UnityEngine.Object)null)
 				{
 					continue;
+				}
+				// Guarantee a valid UID — freshly spawned racks may have rackPosGlobalUID=0 on their positions,
+				// which would cause save data with rackPositionUID=0, breaking the load screen indefinitely.
+				if (val4.rackPosGlobalUID <= 0)
+				{
+					val.lastUsedRackPositionGlobalUID++;
+					val4.rackPosGlobalUID = val.lastUsedRackPositionGlobalUID;
+					((MelonBase)this).LoggerInstance.Msg($"  Assigned missing UID {val4.rackPosGlobalUID} to RackPosition slot {num15}");
 				}
 				try
 				{
