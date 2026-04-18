@@ -1,0 +1,15 @@
+# Build outputs
+bin/
+obj/
+
+# VS Code workspace settings (optional — remove if you want to share)
+.vscode/
+
+# Game DLLs — contributors must supply these from their own install
+# See README.md > Building from Source
+libs/
+
+# User-specific files
+*.user
+*.suo
+.vs/
