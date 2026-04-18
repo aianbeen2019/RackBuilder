@@ -2104,7 +2104,7 @@ public class RackBuilderCore : MelonMod
 					{
 						continue;
 					}
-					GameObject val7 = UnityEngine.Object.Instantiate<GameObject>(val6, val.parentUsableObjects);
+					GameObject val7 = UnityEngine.Object.Instantiate<GameObject>(val6, ((Component)val4).transform);
 					UsableObject component = val7.GetComponent<UsableObject>();
 					Vector3 val8 = Vector3.zero;
 					Quaternion localRotation = Quaternion.identity;
@@ -2114,7 +2114,6 @@ public class RackBuilderCore : MelonMod
 						localRotation = Quaternion.Euler(component.secondRotation);
 						((MelonBase)this).LoggerInstance.Msg($"  {itemChoice.name} secondPos={val8} secondRot={component.secondRotation} pivotPos={component.offsetPivotPosition}");
 					}
-					val7.transform.SetParent(((Component)val4).transform);
 					val7.transform.localPosition = val8;
 					val7.transform.localRotation = localRotation;
 					Rigidbody component2 = val7.GetComponent<Rigidbody>();
