@@ -2140,6 +2140,12 @@ public class RackBuilderCore : MelonMod
 					}
 					val7.transform.localPosition = val8;
 					val7.transform.localRotation = localRotation;
+					// Reparent to parentUsableObjects (world position preserved) so the game's
+					// interaction/raycast system can see the object immediately — exactly matching
+					// what the load path does. currentRackPosition keeps the object-ref link to
+					// the slot so Pass 3 (ShowRackDetail) and Pass B (RemoveItemByAnchor) still work.
+					if ((UnityEngine.Object)(object)val.parentUsableObjects != (UnityEngine.Object)null)
+						val7.transform.SetParent(val.parentUsableObjects, true);
 					Rigidbody component2 = val7.GetComponent<Rigidbody>();
 					if ((UnityEngine.Object)(object)component2 != (UnityEngine.Object)null)
 					{
