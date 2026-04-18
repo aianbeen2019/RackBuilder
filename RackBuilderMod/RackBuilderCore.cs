@@ -2187,76 +2187,24 @@ public class RackBuilderCore : MelonMod
 						component6.patchPanelId = "Mod_" + Guid.NewGuid().ToString().Substring(0, 8);
 						component6.patchPanelType = itemChoice.prefabIndex;
 					}
-					try
+					// Set timeToBrake/eolTime and broken state directly — do NOT call InsertedInRack/
+					// SwitchInsertedInRack because those methods start a coroutine that reparents the
+					// object away from the RackPosition hierarchy on the next frame, which breaks
+					// both RemoveItemByAnchor (can't find the object) and Pass 1 scan.
+					// All fields needed by the save system are already set above.
+					if ((UnityEngine.Object)(object)component4 != (UnityEngine.Object)null)
 					{
-						if ((UnityEngine.Object)(object)component4 != (UnityEngine.Object)null)
-						{
-							int timeToBrake = 99999;
-							int eolTime = 99999;
-							component4.timeToBrake = timeToBrake;
-							component4.eolTime = eolTime;
-							component4.isBroken = false;
-							component4.isWarningCleared = true;
-							ServerSaveData val9 = new ServerSaveData();
-							val9.serverID = component4.ServerID;
-							val9.serverType = component4.serverType;
-							val9.prefabID = ((UsableObject)component4).prefabID;
-							val9.rackPositionUID = val4.rackPosGlobalUID;
-							val9.position = val7.transform.position;
-							val9.rotation = val7.transform.rotation;
-							val9.customerID = 0;
-							val9.ip = "";
-							val9.isOn = false;
-							val9.isBroken = false;
-							val9.isWarningCleared = true;
-							val9.timeToBrake = timeToBrake;
-							val9.eolTime = eolTime;
-							component4.ServerInsertedInRack(val9);
-							// Re-parent back under RackPosition — InsertedInRack may reparent the object,
-							// which would prevent Pass 1 from finding it and RemoveItemByAnchor from destroying it.
-							if (val7.transform.parent != ((Component)val4).transform)
-								val7.transform.SetParent(((Component)val4).transform, true);
-						}
-						if ((UnityEngine.Object)(object)component5 != (UnityEngine.Object)null)
-						{
-							int timeToBrake2 = 99999;
-							int eolTime2 = 99999;
-							component5.timeToBrake = timeToBrake2;
-							component5.eolTime = eolTime2;
-							component5.isBroken = false;
-							component5.isWarningCleared = true;
-							SwitchSaveData val10 = new SwitchSaveData();
-							val10.switchID = component5.switchId;
-							val10.switchType = component5.switchType;
-							val10.rackPositionUID = val4.rackPosGlobalUID;
-							val10.position = val7.transform.position;
-							val10.rotation = val7.transform.rotation;
-							val10.isOn = false;
-							val10.label = "";
-							val10.isBroken = false;
-							val10.isWarningCleared = true;
-							val10.timeToBrake = timeToBrake2;
-							val10.eolTime = eolTime2;
-							component5.SwitchInsertedInRack(val10);
-							if (val7.transform.parent != ((Component)val4).transform)
-								val7.transform.SetParent(((Component)val4).transform, true);
-						}
-						if ((UnityEngine.Object)(object)component6 != (UnityEngine.Object)null)
-						{
-							PatchPanelSaveData val11 = new PatchPanelSaveData();
-							val11.patchPanelID = component6.patchPanelId;
-							val11.patchPanelType = component6.patchPanelType;
-							val11.rackPositionUID = val4.rackPosGlobalUID;
-							val11.position = val7.transform.position;
-							val11.rotation = val7.transform.rotation;
-							component6.InsertedInRack(val11);
-							if (val7.transform.parent != ((Component)val4).transform)
-								val7.transform.SetParent(((Component)val4).transform, true);
-						}
+						component4.timeToBrake = 99999;
+						component4.eolTime = 99999;
+						component4.isBroken = false;
+						component4.isWarningCleared = true;
 					}
-					catch (Exception ex)
+					if ((UnityEngine.Object)(object)component5 != (UnityEngine.Object)null)
 					{
-						((MelonBase)this).LoggerInstance.Warning("InsertedInRack finalizer failed for " + itemChoice.name + ": " + ex.Message);
+						component5.timeToBrake = 99999;
+						component5.eolTime = 99999;
+						component5.isBroken = false;
+						component5.isWarningCleared = true;
 					}
 					try
 					{
