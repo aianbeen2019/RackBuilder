@@ -805,65 +805,8 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 
-		// Pass 3: scene-wide scan — catches items reparented outside the rack hierarchy by the save/load system.
-		// Filter by rackPositionUID matching any position UID in the selected rack.
-		{
-			int p3uo = 0, p3srv = 0, p3sw = 0;
-			foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
-			{
-				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
-				if (uo.rackPositionUID == 0) continue; // unplaced object — skip
-				if (!rpUidToSlot.TryGetValue(uo.rackPositionUID, out int slot)) continue;
-				if (slotsFound.Contains(slot)) continue;
-				string label2 = DescribeUsableObject(uo);
-				if (label2 == null) continue;
-				string colorType2 = ClassifyLabel(label2);
-				int size2 = (uo.sizeInU > 0) ? uo.sizeInU : 1;
-				list.Add((slot, size2, label2, colorType2, uo));
-				for (int u = slot; u < slot + size2 && u < num; u++) slotsFound.Add(u);
-				if (_selectedRack.isPositionUsed != null)
-				{
-					for (int u = slot; u < slot + size2 && u < ((Il2CppArrayBase<int>)(object)_selectedRack.isPositionUsed).Length; u++)
-					{
-						if (((Il2CppArrayBase<int>)(object)_selectedRack.isPositionUsed)[u] == 0)
-						{
-							((Il2CppArrayBase<int>)(object)_selectedRack.isPositionUsed)[u] = 1;
-							num2++;
-						}
-					}
-				}
-				p3uo++;
-			}
-			// IL2CPP concrete-type fallbacks for save-loaded items whose UsableObject cast fails
-			foreach (Server srv2 in UnityEngine.Object.FindObjectsOfType<Server>())
-			{
-				if ((UnityEngine.Object)(object)srv2 == (UnityEngine.Object)null) continue;
-				UsableObject uoSrv = (UsableObject)(object)srv2;
-				if (uoSrv.rackPositionUID == 0) continue;
-				if (!rpUidToSlot.TryGetValue(uoSrv.rackPositionUID, out int slot)) continue;
-				if (slotsFound.Contains(slot)) continue;
-				int size2 = (uoSrv.sizeInU > 0) ? uoSrv.sizeInU : 3;
-				string label2 = srv2.isBroken ? $"Server {size2}U BROKEN" : (srv2.isOn ? $"Server {size2}U [ON]" : $"Server {size2}U [OFF]");
-				list.Add((slot, size2, label2, "Server", uoSrv));
-				for (int u = slot; u < slot + size2 && u < num; u++) slotsFound.Add(u);
-				p3srv++;
-			}
-			foreach (NetworkSwitch sw2 in UnityEngine.Object.FindObjectsOfType<NetworkSwitch>())
-			{
-				if ((UnityEngine.Object)(object)sw2 == (UnityEngine.Object)null) continue;
-				UsableObject uoSw = (UsableObject)(object)sw2;
-				if (uoSw.rackPositionUID == 0) continue;
-				if (!rpUidToSlot.TryGetValue(uoSw.rackPositionUID, out int slot)) continue;
-				if (slotsFound.Contains(slot)) continue;
-				string label2 = sw2.isBroken ? "Switch BROKEN" : (sw2.isOn ? "Switch [ON]" : "Switch [OFF]");
-				list.Add((slot, 1, label2, "Switch", uoSw));
-				slotsFound.Add(slot);
-				p3sw++;
-			}
-			((MelonBase)this).LoggerInstance.Msg($"[ShowRackDetail] Pass1={list.Count - p3uo - p3srv - p3sw} | Pass2 hierarchy | Pass3 scene-wide: {p3uo} UO, {p3srv} srv, {p3sw} sw | total={list.Count}");
-		}
+		((MelonBase)this).LoggerInstance.Msg($"[ShowRackDetail] Pass1+2 total={list.Count}");
 
-		// Recompute free slots after possible reconciliation
 		num5 = num - num2 - num3;
 		if (list.Count > 0)
 		{
@@ -2269,6 +2212,10 @@ public class RackBuilderCore : MelonMod
 							val9.timeToBrake = timeToBrake;
 							val9.eolTime = eolTime;
 							component4.ServerInsertedInRack(val9);
+							// Re-parent back under RackPosition — InsertedInRack may reparent the object,
+							// which would prevent Pass 1 from finding it and RemoveItemByAnchor from destroying it.
+							if (val7.transform.parent != ((Component)val4).transform)
+								val7.transform.SetParent(((Component)val4).transform, true);
 						}
 						if ((UnityEngine.Object)(object)component5 != (UnityEngine.Object)null)
 						{
@@ -2291,6 +2238,8 @@ public class RackBuilderCore : MelonMod
 							val10.timeToBrake = timeToBrake2;
 							val10.eolTime = eolTime2;
 							component5.SwitchInsertedInRack(val10);
+							if (val7.transform.parent != ((Component)val4).transform)
+								val7.transform.SetParent(((Component)val4).transform, true);
 						}
 						if ((UnityEngine.Object)(object)component6 != (UnityEngine.Object)null)
 						{
@@ -2301,6 +2250,8 @@ public class RackBuilderCore : MelonMod
 							val11.position = val7.transform.position;
 							val11.rotation = val7.transform.rotation;
 							component6.InsertedInRack(val11);
+							if (val7.transform.parent != ((Component)val4).transform)
+								val7.transform.SetParent(((Component)val4).transform, true);
 						}
 					}
 					catch (Exception ex)
