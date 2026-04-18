@@ -727,7 +727,7 @@ public class RackBuilderCore : MelonMod
 					{
 						size = (uo.sizeInU > 0) ? uo.sizeInU : 1;
 						label = DescribeUsableObject(uo);
-						colorType = ClassifyLabel(label);
+						if (label != null) colorType = ClassifyLabel(label);
 					}
 					else
 					{
@@ -794,6 +794,7 @@ public class RackBuilderCore : MelonMod
 					}
 					if (slotsFound.Contains(slot)) continue;
 					string label2 = DescribeUsableObject(uo);
+					if (label2 == null) continue;
 					string colorType2 = ClassifyLabel(label2);
 					int size2 = (uo.sizeInU > 0) ? uo.sizeInU : 1;
 					list.Add((slot, size2, label2, colorType2, uo));
@@ -812,6 +813,7 @@ public class RackBuilderCore : MelonMod
 				if (!rpUidToSlot.TryGetValue(uo.rackPositionUID, out int slot)) continue;
 				if (slotsFound.Contains(slot)) continue;
 				string label2 = DescribeUsableObject(uo);
+				if (label2 == null) continue;
 				string colorType2 = ClassifyLabel(label2);
 				int size2 = (uo.sizeInU > 0) ? uo.sizeInU : 1;
 				list.Add((slot, size2, label2, colorType2, uo));
@@ -900,9 +902,9 @@ public class RackBuilderCore : MelonMod
 		AddDivider();
 		if (num4 > 0)
 		{
-			AddClickableRow($"  CONFIRM — Install {num4} items ({num3}U) via Technician", new Color(0.15f, 0.4f, 0.15f), delegate
+			AddClickableRow($"  CONFIRM — Install {num4} items ({num3}U)", new Color(0.15f, 0.4f, 0.15f), delegate
 			{
-				InstallViaNPC();
+				InstallCartItems();
 			});
 			AddSpacer();
 			AddClickableRow("  Clear Cart", new Color(0.4f, 0.1f, 0.1f), delegate
@@ -2233,8 +2235,8 @@ public class RackBuilderCore : MelonMod
 					{
 						if ((UnityEngine.Object)(object)component4 != (UnityEngine.Object)null)
 						{
-							int timeToBrake = ((component4.timeToBrake > 0) ? component4.timeToBrake : 99999);
-							int eolTime = ((component4.eolTime > 0) ? component4.eolTime : 99999);
+							int timeToBrake = 99999;
+							int eolTime = 99999;
 							component4.timeToBrake = timeToBrake;
 							component4.eolTime = eolTime;
 							component4.isBroken = false;
@@ -2257,8 +2259,8 @@ public class RackBuilderCore : MelonMod
 						}
 						if ((UnityEngine.Object)(object)component5 != (UnityEngine.Object)null)
 						{
-							int timeToBrake2 = ((component5.timeToBrake > 0) ? component5.timeToBrake : 99999);
-							int eolTime2 = ((component5.eolTime > 0) ? component5.eolTime : 99999);
+							int timeToBrake2 = 99999;
+							int eolTime2 = 99999;
 							component5.timeToBrake = timeToBrake2;
 							component5.eolTime = eolTime2;
 							component5.isBroken = false;
@@ -2678,6 +2680,10 @@ public class RackBuilderCore : MelonMod
 
 	private static string DescribeUsableObject(UsableObject uo)
 	{
+		// Skip SFP modules — they are inserted into switch ports and share rackPositionUID with their host switch
+		SFPModule sfp = ((Component)uo).GetComponent<SFPModule>();
+		if ((UnityEngine.Object)(object)sfp != (UnityEngine.Object)null)
+			return null;
 		Server srv = ((Component)uo).GetComponent<Server>();
 		if ((UnityEngine.Object)(object)srv != (UnityEngine.Object)null)
 		{
@@ -2686,11 +2692,15 @@ public class RackBuilderCore : MelonMod
 		}
 		NetworkSwitch sw = ((Component)uo).GetComponent<NetworkSwitch>();
 		if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null)
-			return sw.isBroken ? "Switch BROKEN" : (!sw.isOn ? "Switch [OFF]" : "Switch [ON]");
+		{
+			int portCount = (sw.cableLinkSwitchPorts != null) ? ((Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts).Length : 0;
+			string swLabel = (portCount > 0) ? $"Switch ({portCount}p)" : "Switch";
+			return sw.isBroken ? (swLabel + " BROKEN") : (!sw.isOn ? (swLabel + " [OFF]") : (swLabel + " [ON]"));
+		}
 		PatchPanel pp = ((Component)uo).GetComponent<PatchPanel>();
 		if ((UnityEngine.Object)(object)pp != (UnityEngine.Object)null)
 			return "Patch Panel";
-		return $"{uo.objectInHandType} ({((UnityEngine.Object)(object)((Component)uo).gameObject).name})";
+		return null;
 	}
 
 	private static string ClassifyLabel(string label)
