@@ -692,6 +692,8 @@ public class RackBuilderCore : MelonMod
 
 		// Build rackPositionUID → slot-index lookup for Pass 2 (save-reload reliable mapping)
 		Dictionary<int, int> rpUidToSlot = new Dictionary<int, int>();
+		// Build RackPosition object-reference → slot-index lookup for Pass 3 (collision-safe)
+		Dictionary<int, int> rpInstanceToSlot = new Dictionary<int, int>();
 		if (_selectedRack.positions != null)
 		{
 			for (int s = 0; s < num; s++)
@@ -700,6 +702,8 @@ public class RackBuilderCore : MelonMod
 				// Skip UID=0 — unassigned positions must never match unplaced objects (rackPositionUID default is also 0)
 				if ((UnityEngine.Object)(object)rp0 != (UnityEngine.Object)null && rp0.rackPosGlobalUID != 0)
 					rpUidToSlot[rp0.rackPosGlobalUID] = s;
+				if ((UnityEngine.Object)(object)rp0 != (UnityEngine.Object)null)
+					rpInstanceToSlot[((Component)rp0).gameObject.GetInstanceID()] = s;
 			}
 		}
 
@@ -805,16 +809,16 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 
-		// Pass 3: UID-exact scene-wide lookup — catches items the game reparented to parentUsableObjects
-		// (Start() on UsableObject/Server moves items there). Scoped strictly to this rack's slot UIDs.
-		// Safe: each UID in rpUidToSlot is unique to this rack's RackPosition slots (UID=0 excluded).
+		// Pass 3: catches items the game reparented to parentUsableObjects (Start() on UsableObject/Server).
+		// Uses currentRackPosition object-reference — immune to UID integer collisions across racks.
 		if (slotsFound.Count < num)
 		{
 			foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
 			{
 				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
-				if (uo.rackPositionUID == 0) continue;
-				if (!rpUidToSlot.TryGetValue(uo.rackPositionUID, out int slot)) continue;
+				if ((UnityEngine.Object)(object)uo.currentRackPosition == (UnityEngine.Object)null) continue;
+				int rpId = ((Component)uo.currentRackPosition).gameObject.GetInstanceID();
+				if (!rpInstanceToSlot.TryGetValue(rpId, out int slot)) continue;
 				if (slotsFound.Contains(slot)) continue;
 				string label2 = DescribeUsableObject(uo);
 				if (label2 == null) continue;
@@ -2510,21 +2514,18 @@ public class RackBuilderCore : MelonMod
 				}
 			}
 		}
-		// Pass B: if the game reparented the item (e.g. Start() moved it to parentUsableObjects),
-		// find it scene-wide by rackPositionUID matching this exact slot.
+		// Pass B: if the game reparented the item (Start() moved it to parentUsableObjects),
+		// find it by currentRackPosition object-reference — immune to UID integer collisions across racks.
 		if ((UnityEngine.Object)(object)val2 == (UnityEngine.Object)null && val.rackPosGlobalUID != 0)
 		{
 			foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
 			{
-				if ((UnityEngine.Object)(object)uo != (UnityEngine.Object)null && uo.rackPositionUID == val.rackPosGlobalUID)
-				{
-					SFPModule sfp = ((Component)uo).GetComponent<SFPModule>();
-					if ((UnityEngine.Object)(object)sfp == (UnityEngine.Object)null)
-					{
-						val2 = uo;
-						break;
-					}
-				}
+				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
+				if ((UnityEngine.Object)(object)uo.currentRackPosition != (UnityEngine.Object)(object)val) continue;
+				SFPModule sfp = ((Component)uo).GetComponent<SFPModule>();
+				if ((UnityEngine.Object)(object)sfp != (UnityEngine.Object)null) continue;
+				val2 = uo;
+				break;
 			}
 		}
 		if (size <= 0)
