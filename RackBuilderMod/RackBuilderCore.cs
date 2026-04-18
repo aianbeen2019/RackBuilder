@@ -805,7 +805,27 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 
-		((MelonBase)this).LoggerInstance.Msg($"[ShowRackDetail] Pass1+2 total={list.Count}");
+		// Pass 3: UID-exact scene-wide lookup — catches items the game reparented to parentUsableObjects
+		// (Start() on UsableObject/Server moves items there). Scoped strictly to this rack's slot UIDs.
+		// Safe: each UID in rpUidToSlot is unique to this rack's RackPosition slots (UID=0 excluded).
+		if (slotsFound.Count < num)
+		{
+			foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
+			{
+				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
+				if (uo.rackPositionUID == 0) continue;
+				if (!rpUidToSlot.TryGetValue(uo.rackPositionUID, out int slot)) continue;
+				if (slotsFound.Contains(slot)) continue;
+				string label2 = DescribeUsableObject(uo);
+				if (label2 == null) continue;
+				string colorType2 = ClassifyLabel(label2);
+				int size2 = (uo.sizeInU > 0) ? uo.sizeInU : 1;
+				list.Add((slot, size2, label2, colorType2, uo));
+				for (int u = slot; u < slot + size2 && u < num; u++) slotsFound.Add(u);
+			}
+		}
+
+		((MelonBase)this).LoggerInstance.Msg($"[ShowRackDetail] Pass1+2+3 total={list.Count}");
 
 		num5 = num - num2 - num3;
 		if (list.Count > 0)
@@ -2464,6 +2484,7 @@ public class RackBuilderCore : MelonMod
 			return;
 		}
 		UsableObject val2 = null;
+		// Pass A: hierarchy walk under the target RackPosition
 		for (int i = 0; i < ((Component)val).transform.childCount; i++)
 		{
 			Transform child = ((Component)val).transform.GetChild(i);
@@ -2489,10 +2510,22 @@ public class RackBuilderCore : MelonMod
 				}
 			}
 		}
-		if ((UnityEngine.Object)(object)val2 == (UnityEngine.Object)null)
+		// Pass B: if the game reparented the item (e.g. Start() moved it to parentUsableObjects),
+		// find it scene-wide by rackPositionUID matching this exact slot.
+		if ((UnityEngine.Object)(object)val2 == (UnityEngine.Object)null && val.rackPosGlobalUID != 0)
 		{
-			((MelonBase)this).LoggerInstance.Msg($"No UsableObject at anchor {anchorIdx}; skipping");
-			return;
+			foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
+			{
+				if ((UnityEngine.Object)(object)uo != (UnityEngine.Object)null && uo.rackPositionUID == val.rackPosGlobalUID)
+				{
+					SFPModule sfp = ((Component)uo).GetComponent<SFPModule>();
+					if ((UnityEngine.Object)(object)sfp == (UnityEngine.Object)null)
+					{
+						val2 = uo;
+						break;
+					}
+				}
+			}
 		}
 		if (size <= 0)
 		{
