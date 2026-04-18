@@ -900,9 +900,9 @@ public class RackBuilderCore : MelonMod
 		AddDivider();
 		if (num4 > 0)
 		{
-			AddClickableRow($"  CONFIRM — Install {num4} items ({num3}U)", new Color(0.15f, 0.4f, 0.15f), delegate
+			AddClickableRow($"  CONFIRM — Install {num4} items ({num3}U) via Technician", new Color(0.15f, 0.4f, 0.15f), delegate
 			{
-				InstallCartItems();
+				InstallViaNPC();
 			});
 			AddSpacer();
 			AddClickableRow("  Clear Cart", new Color(0.4f, 0.1f, 0.1f), delegate
