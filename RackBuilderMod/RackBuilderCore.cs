@@ -1,7 +1,10 @@
 ﻿using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Il2Cpp;
 using Il2CppInterop.Runtime.InteropTypes;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
@@ -26,12 +29,77 @@ public class RackBuilderCore : MelonMod
 
 		public int sizeInU;
 	}
+
+	[Serializable]
+	public class CableLinkData
+	{
+		[JsonPropertyName("serverID")]
+		public string ServerID { get; set; }
+
+		[JsonPropertyName("serverRackPositionUID")]
+		public int ServerRackPositionUID { get; set; }
+
+		[JsonPropertyName("serverPortIndex")]
+		public int ServerPortIndex { get; set; }
+
+		[JsonPropertyName("switchID")]
+		public string SwitchID { get; set; }
+
+		[JsonPropertyName("switchRackPositionUID")]
+		public int SwitchRackPositionUID { get; set; }
+
+		[JsonPropertyName("switchPortIndex")]
+		public int SwitchPortIndex { get; set; }
+
+		[JsonPropertyName("patchPanelID")]
+		public string PatchPanelID { get; set; }
+
+		[JsonPropertyName("patchPanelRackPositionUID")]
+		public int PatchPanelRackPositionUID { get; set; }
+
+		[JsonPropertyName("patchNearPortIndex")]
+		public int PatchNearPortIndex { get; set; } = -1;
+
+		[JsonPropertyName("patchFarPortIndex")]
+		public int PatchFarPortIndex { get; set; } = -1;
+	}
+
+	[Serializable]
+	public class CableTopologyData
+	{
+		[JsonPropertyName("layoutFingerprint")]
+		public string LayoutFingerprint { get; set; } = "";
+
+		[JsonPropertyName("cables")]
+		public List<CableLinkData> Cables { get; set; } = new List<CableLinkData>();
+	}
+
+	[Serializable]
+	public class RackRoleEntry
+	{
+		[JsonPropertyName("rackKey")]
+		public string RackKey { get; set; }
+
+		[JsonPropertyName("role")]
+		public string Role { get; set; }
+	}
+
+	[Serializable]
+	public class RackRoleData
+	{
+		[JsonPropertyName("racks")]
+		public List<RackRoleEntry> Racks { get; set; } = new List<RackRoleEntry>();
+	}
 	
 
 	private bool _integrated;
+	private bool _startupCableRestoreQueued;
 
 	// Fingerprint of rack instance IDs at last UI open ? used to detect same-scene save reloads
 	private HashSet<int> _lastRackIds = new HashSet<int>();
+
+	// Cable IDs created by AutoWire — shielded from the post-placement scrub coroutine.
+	private HashSet<int> _autoWireProtectedCableIds = new HashSet<int>();
 
 	private ComputerShop _shop;
 
@@ -49,11 +117,16 @@ public class RackBuilderCore : MelonMod
 
 	private RackMount _pendingRemoveMount;
 
+	private bool _pendingBulkClearConfirmation;
+
 	private Dictionary<int, int> _cartQty = new Dictionary<int, int>();
 
 	private List<(int sfpType, float speed, int prefabIdx, string name)> _sfpPrefabInfo;
 
 	private Dictionary<NetworkSwitch, Dictionary<int, float>> _switchTypeSpeedMap = new Dictionary<NetworkSwitch, Dictionary<int, float>>();
+
+	// When true, ShowRackDetail / ShowRackList calls are no-ops (background auto-wire pass).
+	private bool _suppressUiUpdates;
 
 	private List<CableLink> _cachedRackRailClips;
 
@@ -66,6 +139,14 @@ public class RackBuilderCore : MelonMod
 	private bool _disableAutoWireForDebug = false;
 
 	private bool _enableVerboseDiagnostics = false;
+
+	private const string RackRoleServer = "server";
+
+	private const string RackRoleNetwork = "network";
+
+	private bool _rackRolesLoaded;
+
+	private Dictionary<string, string> _rackRolesByKey = new Dictionary<string, string>();
 
 	private void LogPlacementDebugState(string stage, Server srv, NetworkSwitch sw)
 	{
@@ -164,6 +245,7 @@ public class RackBuilderCore : MelonMod
 		_onDetailPage = false;
 		_allRacks.Clear();
 		_pendingRemoveMount = null;
+		_pendingBulkClearConfirmation = false;
 		_cartQty.Clear();
 		_itemChoices.Clear();
 		_cachedRackRailClips = null;
@@ -171,12 +253,38 @@ public class RackBuilderCore : MelonMod
 		_cachedOverheadClips = null;
 		_sfpPrefabInfo = null;
 		_switchTypeSpeedMap.Clear();
+		_autoWireProtectedCableIds.Clear();
+		_suppressUiUpdates = false;
+		_startupCableRestoreQueued = false;
 	}
 
 	public override void OnUpdate()
 	{
 		if (!_integrated)
 			TryIntegrate();
+		TryQueueStartupCableRestore();
+	}
+
+	private void TryQueueStartupCableRestore()
+	{
+		if (_startupCableRestoreQueued)
+			return;
+		CablePositions cablePositions = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		if ((UnityEngine.Object)(object)cablePositions == (UnityEngine.Object)null)
+			return;
+		int rackCount = 0;
+		foreach (Rack rack in UnityEngine.Object.FindObjectsOfType<Rack>())
+		{
+			if ((UnityEngine.Object)(object)rack != (UnityEngine.Object)null)
+				rackCount++;
+		}
+		if (rackCount == 0)
+			return;
+		if (!ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount))
+			return;
+		_startupCableRestoreQueued = true;
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Startup cable restore queued (live={liveCableCount}, expected={expectedCableCount})");
+		MelonCoroutines.Start(RestoreCablesDeferred(10));
 	}
 
 
@@ -189,6 +297,15 @@ public class RackBuilderCore : MelonMod
 		{
 			if ((UnityEngine.Object)(object)r != (UnityEngine.Object)null)
 				currentIds.Add(((UnityEngine.Object)(object)r).GetInstanceID());
+		}
+
+		// First observation only establishes the baseline. Without this, the first time the user
+		// opens Rack Manager we misclassify the current scene as a save reload and kick off the
+		// full reset/autowire pipeline on the UI open path, which causes the visible freeze.
+		if (_lastRackIds.Count == 0)
+		{
+			_lastRackIds = currentIds;
+			return;
 		}
 
 		// If the set has meaningfully changed, a save was likely reloaded
@@ -206,7 +323,28 @@ public class RackBuilderCore : MelonMod
 			TryIntegrate();
 			if (wasShowing)
 				ShowRackList();
+			// Restore persisted cables only; full rack-wide autowire on load can stall large saves.
+			MelonCoroutines.Start(RestoreCablesDeferred(10));
+			return;
 		}
+
+		if (ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount))
+		{
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Topology mismatch detected after menu reload (live={liveCableCount}, expected={expectedCableCount})");
+			MelonCoroutines.Start(RestoreCablesDeferred(10));
+		}
+	}
+
+	private IEnumerator RestoreCablesDeferred(int frames)
+	{
+		for (int i = 0; i < frames; i++)
+			yield return null;
+		((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Restore-only cable pass starting…");
+		ClearOrphanedCableIds();
+		RestoreCableTopologyFromFile();
+		ClearEmptySfpPortSpeeds();
+		SaveCableTopology();
+		((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Restore-only cable pass complete");
 	}
 
 	private IEnumerator EnableCollidersDelayed(GameObject go)
@@ -226,10 +364,823 @@ public class RackBuilderCore : MelonMod
 		}
 	}
 
+	private IEnumerator RefreshRackDetailDeferred(int frames)
+	{
+		for (int i = 0; i < frames; i++)
+			yield return null;
+		if (_onDetailPage && (UnityEngine.Object)(object)_selectedRack != (UnityEngine.Object)null)
+			ShowRackDetail();
+	}
+
+	private IEnumerator EnforceSfpSpeedDeferred(SFPModule module, CableLink port, float expectedSpeed, int frames)
+	{
+		for (int i = 0; i < frames; i++)
+		{
+			yield return null;
+			if (expectedSpeed <= 0f) yield break;
+			if ((UnityEngine.Object)(object)module != (UnityEngine.Object)null && module.speed != expectedSpeed)
+				module.speed = expectedSpeed;
+			if ((UnityEngine.Object)(object)port != (UnityEngine.Object)null && port.connectionSpeed != expectedSpeed)
+				port.connectionSpeed = expectedSpeed;
+		}
+	}
+
 	private IEnumerator RefreshPatchPanelDeferred(PatchPanel panel)
 	{
 		// Intentionally do not call ValidateRackPosition here ? it triggers internal auto-wiring.
 		yield break;
+	}
+
+	/// <summary>
+	/// After a save/reload the game's InsertedInRack resets cable state from save-data that never
+	/// included our mod-created cables. This coroutine re-runs AutoWire on every rack so the
+	/// visual cables are restored without user interaction.
+	/// </summary>
+	private IEnumerator AutoWireAllRacksDeferred(int frames)
+	{
+		for (int i = 0; i < frames; i++) yield return null;
+		((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Post-reload auto-wire starting…");
+		// Clear stale cableIDsOnLink values that the game saved from a prior session but whose
+		// visual cable was never persisted in CablePositions. Without this, ports look occupied
+		// and auto-wire skips them on every reload after the first.
+		ClearOrphanedCableIds();
+		// Restore cables from our persistent topology file before running auto-wire.
+		RestoreCableTopologyFromFile();
+		Rack savedRack = _selectedRack;
+		int wiredCount = 0;
+		_suppressUiUpdates = true;
+		try
+		{
+			foreach (Rack r in UnityEngine.Object.FindObjectsOfType<Rack>())
+			{
+				if ((UnityEngine.Object)(object)r == (UnityEngine.Object)null) continue;
+				_selectedRack = r;
+				AutowireRackSilent(ref wiredCount);
+			}
+		}
+		finally
+		{
+			_selectedRack = savedRack;
+			_suppressUiUpdates = false;
+		}
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Post-reload auto-wire complete — {wiredCount} cables created.");
+		ClearEmptySfpPortSpeeds();
+		// Persist cable topology so it survives next save/reload cycle.
+		SaveCableTopology();
+	}
+
+	private static bool IsPlacedRackObject(Component component)
+	{
+		if ((UnityEngine.Object)(object)component == (UnityEngine.Object)null)
+			return false;
+		UsableObject uo = component.GetComponent<UsableObject>() ?? component.GetComponentInChildren<UsableObject>();
+		if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null)
+			return false;
+		return (UnityEngine.Object)(object)uo.currentRackPosition != (UnityEngine.Object)null || uo.rackPositionUID > 0;
+	}
+
+	private static int GetRackPositionUid(Component component)
+	{
+		if ((UnityEngine.Object)(object)component == (UnityEngine.Object)null)
+			return 0;
+		UsableObject uo = component.GetComponent<UsableObject>() ?? component.GetComponentInChildren<UsableObject>();
+		if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null)
+			return 0;
+		if ((UnityEngine.Object)(object)uo.currentRackPosition != (UnityEngine.Object)null && uo.currentRackPosition.rackPosGlobalUID > 0)
+			return uo.currentRackPosition.rackPosGlobalUID;
+		return uo.rackPositionUID;
+	}
+
+	private static Rack GetRackFromPort(CableLink port)
+	{
+		if ((UnityEngine.Object)(object)port == (UnityEngine.Object)null)
+			return null;
+		Rack fromHierarchy = ((Component)port).GetComponentInParent<Rack>();
+		if ((UnityEngine.Object)(object)fromHierarchy != (UnityEngine.Object)null)
+			return fromHierarchy;
+
+		UsableObject owner = null;
+		if ((UnityEngine.Object)(object)port.parentServer != (UnityEngine.Object)null)
+			owner = (UsableObject)(object)port.parentServer;
+		else if ((UnityEngine.Object)(object)port.parentSwitch != (UnityEngine.Object)null)
+			owner = (UsableObject)(object)port.parentSwitch;
+		else if ((UnityEngine.Object)(object)port.parentPatchPanel != (UnityEngine.Object)null)
+			owner = (UsableObject)(object)port.parentPatchPanel;
+
+		if ((UnityEngine.Object)(object)owner != (UnityEngine.Object)null && (UnityEngine.Object)(object)owner.currentRackPosition != (UnityEngine.Object)null)
+		{
+			Rack fromRackPosition = ((Component)owner.currentRackPosition).GetComponentInParent<Rack>();
+			if ((UnityEngine.Object)(object)fromRackPosition != (UnityEngine.Object)null)
+				return fromRackPosition;
+		}
+
+		return null;
+	}
+
+	private static Rack ResolveRackForRoute(params CableLink[] ports)
+	{
+		if (ports == null)
+			return null;
+		foreach (CableLink port in ports)
+		{
+			Rack rack = GetRackFromPort(port);
+			if ((UnityEngine.Object)(object)rack != (UnityEngine.Object)null)
+				return rack;
+		}
+		return null;
+	}
+
+	private static string BuildCurrentTopologyFingerprint()
+	{
+		List<string> parts = new List<string>();
+		foreach (Server server in UnityEngine.Object.FindObjectsOfType<Server>())
+		{
+			if ((UnityEngine.Object)(object)server == (UnityEngine.Object)null || server.cablelinks == null || !IsPlacedRackObject((Component)(object)server))
+				continue;
+			int rackPositionUid = GetRackPositionUid((Component)(object)server);
+			if (rackPositionUid <= 0)
+				continue;
+			parts.Add($"S:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)server.cablelinks).Length}");
+		}
+		foreach (NetworkSwitch networkSwitch in UnityEngine.Object.FindObjectsOfType<NetworkSwitch>())
+		{
+			if ((UnityEngine.Object)(object)networkSwitch == (UnityEngine.Object)null || networkSwitch.cableLinkSwitchPorts == null || !IsPlacedRackObject((Component)(object)networkSwitch))
+				continue;
+			int rackPositionUid = GetRackPositionUid((Component)(object)networkSwitch);
+			if (rackPositionUid <= 0)
+				continue;
+			parts.Add($"W:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)networkSwitch.cableLinkSwitchPorts).Length}");
+		}
+		foreach (PatchPanel patchPanel in UnityEngine.Object.FindObjectsOfType<PatchPanel>())
+		{
+			if ((UnityEngine.Object)(object)patchPanel == (UnityEngine.Object)null || patchPanel.cableLinkPorts == null || !IsPlacedRackObject((Component)(object)patchPanel))
+				continue;
+			int rackPositionUid = GetRackPositionUid((Component)(object)patchPanel);
+			if (rackPositionUid <= 0)
+				continue;
+			parts.Add($"P:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)patchPanel.cableLinkPorts).Length}");
+		}
+		parts.Sort(StringComparer.Ordinal);
+		return string.Join("|", parts);
+	}
+
+	private static int CountLiveServerPortsWithPersistentCables()
+	{
+		int count = 0;
+		foreach (Server server in UnityEngine.Object.FindObjectsOfType<Server>())
+		{
+			if ((UnityEngine.Object)(object)server == (UnityEngine.Object)null || server.cablelinks == null || !IsPlacedRackObject((Component)(object)server))
+				continue;
+			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)server.cablelinks)
+			{
+				if ((UnityEngine.Object)(object)port != (UnityEngine.Object)null && port.cableIDsOnLink > 0)
+					count++;
+			}
+		}
+		return count;
+	}
+
+	private bool ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount)
+	{
+		expectedCableCount = 0;
+		liveCableCount = 0;
+		try
+		{
+			string filePath = Path.Combine(UnityEngine.Application.persistentDataPath, "RackCables.json");
+			if (!File.Exists(filePath))
+				return false;
+			string json = File.ReadAllText(filePath);
+			CableTopologyData topology = JsonSerializer.Deserialize<CableTopologyData>(json);
+			if (topology == null || topology.Cables == null || topology.Cables.Count == 0)
+				return false;
+			string currentFingerprint = BuildCurrentTopologyFingerprint();
+			if (!string.IsNullOrEmpty(topology.LayoutFingerprint) && !string.Equals(topology.LayoutFingerprint, currentFingerprint, StringComparison.Ordinal))
+				return false;
+			expectedCableCount = topology.Cables.Count;
+			liveCableCount = CountLiveServerPortsWithPersistentCables();
+			return liveCableCount < expectedCableCount;
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("[RackBuilder] Persistent cable restore check failed: " + ex.Message);
+			return false;
+		}
+	}
+
+	private static string GetRackRolesFilePath()
+	{
+		return Path.Combine(UnityEngine.Application.persistentDataPath, "RackRoles.json");
+	}
+
+	private string BuildRackRoleKey(Rack rack)
+	{
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || rack.positions == null)
+			return "";
+		List<int> uids = new List<int>();
+		foreach (RackPosition rp in (Il2CppArrayBase<RackPosition>)(object)rack.positions)
+		{
+			if ((UnityEngine.Object)(object)rp == (UnityEngine.Object)null)
+				continue;
+			if (rp.rackPosGlobalUID > 0)
+				uids.Add(rp.rackPosGlobalUID);
+		}
+		if (uids.Count == 0)
+			return "";
+		uids.Sort();
+		return string.Join("-", uids);
+	}
+
+	private void EnsureRackRolesLoaded()
+	{
+		if (_rackRolesLoaded)
+			return;
+		_rackRolesLoaded = true;
+		_rackRolesByKey.Clear();
+		try
+		{
+			string path = GetRackRolesFilePath();
+			if (!File.Exists(path))
+				return;
+			string json = File.ReadAllText(path);
+			RackRoleData data = JsonSerializer.Deserialize<RackRoleData>(json);
+			if (data?.Racks == null)
+				return;
+			foreach (RackRoleEntry entry in data.Racks)
+			{
+				if (entry == null || string.IsNullOrEmpty(entry.RackKey) || string.IsNullOrEmpty(entry.Role))
+					continue;
+				string role = entry.Role.ToLowerInvariant();
+				if (role != RackRoleServer && role != RackRoleNetwork)
+					continue;
+				_rackRolesByKey[entry.RackKey] = role;
+			}
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Failed to load rack roles: " + ex.Message);
+		}
+	}
+
+	private void SaveRackRoles()
+	{
+		try
+		{
+			RackRoleData data = new RackRoleData();
+			foreach (KeyValuePair<string, string> kv in _rackRolesByKey)
+			{
+				data.Racks.Add(new RackRoleEntry { RackKey = kv.Key, Role = kv.Value });
+			}
+			string json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
+			File.WriteAllText(GetRackRolesFilePath(), json);
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Failed to save rack roles: " + ex.Message);
+		}
+	}
+
+	private string GetRackRole(Rack rack)
+	{
+		EnsureRackRolesLoaded();
+		string key = BuildRackRoleKey(rack);
+		if (string.IsNullOrEmpty(key))
+			return RackRoleServer;
+		if (_rackRolesByKey.TryGetValue(key, out string role) && !string.IsNullOrEmpty(role))
+			return role;
+		return RackRoleServer;
+	}
+
+	private void ToggleRackRole(Rack rack)
+	{
+		EnsureRackRolesLoaded();
+		string key = BuildRackRoleKey(rack);
+		if (string.IsNullOrEmpty(key))
+			return;
+		string oldRole = GetRackRole(rack);
+		string newRole = oldRole == RackRoleNetwork ? RackRoleServer : RackRoleNetwork;
+		_rackRolesByKey[key] = newRole;
+		SaveRackRoles();
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Rack role set to {newRole} for key {key}");
+	}
+
+	private List<UsableObject> CollectRackUsableObjects(Rack rack)
+	{
+		Rack prev = _selectedRack;
+		try
+		{
+			_selectedRack = rack;
+			return CollectRackUsableObjects();
+		}
+		finally
+		{
+			_selectedRack = prev;
+		}
+	}
+
+	private List<NetworkSwitch> CollectRackSwitches(Rack rack)
+	{
+		return ExtractRackSwitches(CollectRackUsableObjects(rack));
+	}
+
+	private List<Server> CollectRackServers(Rack rack)
+	{
+		return ExtractRackServers(CollectRackUsableObjects(rack));
+	}
+
+	private List<Transform> BuildRackEnterPath(CableLink endPort)
+	{
+		List<Transform> exitPath = BuildRackExitPath(endPort);
+		exitPath.Reverse();
+		return exitPath;
+	}
+
+	private int WireRackSwitchesToCustomer(Rack sourceRack, int targetBaseId)
+	{
+		if ((UnityEngine.Object)(object)sourceRack == (UnityEngine.Object)null)
+			return 0;
+		CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null)
+			return 0;
+		CustomerBase targetBase = null;
+		foreach (CustomerBase candidate in UnityEngine.Object.FindObjectsOfType<CustomerBase>())
+		{
+			if ((UnityEngine.Object)(object)candidate != (UnityEngine.Object)null && candidate.customerBaseID == targetBaseId)
+			{
+				targetBase = candidate;
+				break;
+			}
+		}
+		if ((UnityEngine.Object)(object)targetBase == (UnityEngine.Object)null || targetBase.cableLinks == null)
+			return 0;
+
+		List<CableLink> freeCustomerPorts = new List<CableLink>();
+		foreach (CableLink basePort in (Il2CppArrayBase<CableLink>)(object)targetBase.cableLinks)
+		{
+			if (IsPortReadyForCable(basePort))
+				freeCustomerPorts.Add(basePort);
+		}
+		if (freeCustomerPorts.Count == 0)
+			return 0;
+
+		List<CableLink> sourceSwitchPorts = new List<CableLink>();
+		foreach (NetworkSwitch sw in CollectRackSwitches(sourceRack))
+		{
+			if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null || sw.cableLinkSwitchPorts == null)
+				continue;
+			foreach (CableLink swPort in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
+			{
+				if (!IsPortReadyForCable(swPort))
+					continue;
+				sourceSwitchPorts.Add(swPort);
+			}
+		}
+		if (sourceSwitchPorts.Count == 0)
+			return 0;
+
+		Vector3 basePos = ((Component)targetBase).transform.position;
+		Vector3 rackPos = ((Component)sourceRack).transform.position;
+		List<Transform> overhead = BuildOverheadPath(rackPos, basePos);
+		int wired = 0;
+		foreach (CableLink swPort in sourceSwitchPorts)
+		{
+			CableLink basePort = freeCustomerPorts.FirstOrDefault((CableLink p) => IsPortReadyForCable(p) && p.isFibrePort == swPort.isFibrePort);
+			if ((UnityEngine.Object)(object)basePort == (UnityEngine.Object)null)
+				continue;
+			Rack prev = _selectedRack;
+			try
+			{
+				_selectedRack = sourceRack;
+				List<Transform> waypoints = new List<Transform>();
+				waypoints.AddRange(BuildRackExitPath(swPort));
+				waypoints.AddRange(overhead);
+				if (CreateCable(cp, swPort, basePort, waypoints, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.Base, ""))
+					wired++;
+			}
+			finally
+			{
+				_selectedRack = prev;
+			}
+		}
+		return wired;
+	}
+
+	private void AutoWireServerRackToCustomerViaNetwork(int targetBaseId)
+	{
+		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
+			return;
+		Rack serverRack = _selectedRack;
+		List<Rack> networkRacks = UnityEngine.Object.FindObjectsOfType<Rack>()
+			.Where((Rack r) => (UnityEngine.Object)(object)r != (UnityEngine.Object)null && (UnityEngine.Object)(object)r != (UnityEngine.Object)(object)serverRack && GetRackRole(r) == RackRoleNetwork)
+			.ToList();
+		if (networkRacks.Count == 0)
+		{
+			((MelonBase)this).LoggerInstance.Msg("No network racks defined. Toggle at least one rack to NETWORK role.");
+			ShowRackDetail();
+			return;
+		}
+
+		CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null)
+			return;
+
+		Rack targetNetworkRack = networkRacks
+			.OrderBy((Rack r) => (((Component)r).transform.position - ((Component)serverRack).transform.position).sqrMagnitude)
+			.First();
+
+		List<CableLink> serverRackSwitchPorts = new List<CableLink>();
+		foreach (NetworkSwitch sw in CollectRackSwitches(serverRack))
+		{
+			if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null || sw.cableLinkSwitchPorts == null)
+				continue;
+			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
+			{
+				if (IsPortReadyForCable(port))
+					serverRackSwitchPorts.Add(port);
+			}
+		}
+
+		List<CableLink> networkRackSwitchPorts = new List<CableLink>();
+		foreach (NetworkSwitch sw in CollectRackSwitches(targetNetworkRack))
+		{
+			if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null || sw.cableLinkSwitchPorts == null)
+				continue;
+			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
+			{
+				if (IsPortReadyForCable(port))
+					networkRackSwitchPorts.Add(port);
+			}
+		}
+
+		Vector3 from = ((Component)serverRack).transform.position;
+		Vector3 to = ((Component)targetNetworkRack).transform.position;
+		List<Transform> interRackOverhead = BuildOverheadPath(from, to);
+		int trunkCount = 0;
+		foreach (CableLink src in serverRackSwitchPorts)
+		{
+			CableLink dst = networkRackSwitchPorts.FirstOrDefault((CableLink p) => IsPortReadyForCable(p) && p.isFibrePort == src.isFibrePort);
+			if ((UnityEngine.Object)(object)dst == (UnityEngine.Object)null)
+				continue;
+			Rack prev = _selectedRack;
+			try
+			{
+				List<Transform> waypoints = new List<Transform>();
+				_selectedRack = serverRack;
+				waypoints.AddRange(BuildRackExitPath(src));
+				waypoints.AddRange(interRackOverhead);
+				_selectedRack = targetNetworkRack;
+				waypoints.AddRange(BuildRackEnterPath(dst));
+				if (CreateCable(cp, src, dst, waypoints, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.Switch, ""))
+					trunkCount++;
+			}
+			finally
+			{
+				_selectedRack = prev;
+			}
+		}
+
+		int customerCount = WireRackSwitchesToCustomer(targetNetworkRack, targetBaseId);
+		((MelonBase)this).LoggerInstance.Msg($"Server->Network->Customer complete: trunks={trunkCount}, customerLinks={customerCount}");
+		SaveCableTopology();
+		ShowRackDetail();
+	}
+
+	/// <summary>
+	/// Saves the current cable topology (server→switch mappings) to RackCables.json so it can
+	/// be restored after a save/reload cycle. The game doesn't persist our mod-created cables,
+	/// so we maintain our own independent cable topology file.
+	/// </summary>
+	private void SaveCableTopology()
+	{
+		try
+		{
+			var topology = new CableTopologyData();
+			topology.LayoutFingerprint = BuildCurrentTopologyFingerprint();
+			HashSet<string> seen = new HashSet<string>();
+			var servers = UnityEngine.Object.FindObjectsOfType<Server>().Where((Server s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.ServerID) && s.ServerID.StartsWith("Mod_")).ToList();
+			var switches = UnityEngine.Object.FindObjectsOfType<NetworkSwitch>().Where((NetworkSwitch s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.switchId) && s.switchId.StartsWith("Mod_")).ToList();
+			var panels = UnityEngine.Object.FindObjectsOfType<PatchPanel>().Where((PatchPanel p) => (UnityEngine.Object)(object)p != (UnityEngine.Object)null && p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p) && !string.IsNullOrEmpty(p.patchPanelId) && p.patchPanelId.StartsWith("Mod_")).ToList();
+
+			Dictionary<int, CableLink> switchPortByCableId = new Dictionary<int, CableLink>();
+			foreach (NetworkSwitch sw in switches)
+			{
+				foreach (CableLink swPort in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
+				{
+					if ((UnityEngine.Object)(object)swPort == (UnityEngine.Object)null) continue;
+					int id = swPort.cableIDsOnLink;
+					if (id > 0 && !switchPortByCableId.ContainsKey(id))
+						switchPortByCableId[id] = swPort;
+				}
+			}
+
+			Dictionary<int, CableLink> patchPortByCableId = new Dictionary<int, CableLink>();
+			foreach (PatchPanel panel in panels)
+			{
+				foreach (CableLink ppPort in (Il2CppArrayBase<CableLink>)(object)panel.cableLinkPorts)
+				{
+					if ((UnityEngine.Object)(object)ppPort == (UnityEngine.Object)null) continue;
+					int id = ppPort.cableIDsOnLink;
+					if (id > 0 && !patchPortByCableId.ContainsKey(id))
+						patchPortByCableId[id] = ppPort;
+				}
+			}
+
+			foreach (Server srv in servers)
+			{
+				int portIdx = 0;
+				foreach (CableLink srvPort in (Il2CppArrayBase<CableLink>)(object)srv.cablelinks)
+				{
+					if ((UnityEngine.Object)(object)srvPort == (UnityEngine.Object)null)
+					{
+						portIdx++;
+						continue;
+					}
+					int serverCableId = srvPort.cableIDsOnLink;
+					if (serverCableId <= 0)
+					{
+						portIdx++;
+						continue;
+					}
+
+					if (switchPortByCableId.TryGetValue(serverCableId, out CableLink directSwitchPort))
+					{
+						NetworkSwitch sw = directSwitchPort.parentSwitch;
+						int swPortIdx = GetSwitchPortIndex(directSwitchPort);
+						string key = $"direct:{srv.ServerID}:{portIdx}:{sw.switchId}:{swPortIdx}";
+						if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null && swPortIdx >= 0 && seen.Add(key))
+						{
+							topology.Cables.Add(new CableLinkData
+							{
+								ServerID = srv.ServerID,
+								ServerRackPositionUID = GetRackPositionUid((Component)(object)srv),
+								ServerPortIndex = portIdx,
+								SwitchID = sw.switchId,
+								SwitchRackPositionUID = GetRackPositionUid((Component)(object)sw),
+								SwitchPortIndex = swPortIdx
+							});
+						}
+						portIdx++;
+						continue;
+					}
+
+					if (patchPortByCableId.TryGetValue(serverCableId, out CableLink patchNear) && (UnityEngine.Object)(object)patchNear.parentPatchPanel != (UnityEngine.Object)null)
+					{
+						PatchPanel panel = patchNear.parentPatchPanel;
+						CableLink patchFar = panel.GetPairedLink(patchNear);
+						if ((UnityEngine.Object)(object)patchFar != (UnityEngine.Object)null && switchPortByCableId.TryGetValue(patchFar.cableIDsOnLink, out CableLink routedSwitchPort))
+						{
+							NetworkSwitch sw = routedSwitchPort.parentSwitch;
+							int swPortIdx = GetSwitchPortIndex(routedSwitchPort);
+							int patchNearIdx = GetPatchPanelPortIndex(patchNear);
+							int patchFarIdx = GetPatchPanelPortIndex(patchFar);
+							string key = $"patch:{srv.ServerID}:{portIdx}:{panel.patchPanelId}:{patchNearIdx}:{patchFarIdx}:{sw.switchId}:{swPortIdx}";
+							if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null && swPortIdx >= 0 && patchNearIdx >= 0 && patchFarIdx >= 0 && seen.Add(key))
+							{
+								topology.Cables.Add(new CableLinkData
+								{
+									ServerID = srv.ServerID,
+									ServerRackPositionUID = GetRackPositionUid((Component)(object)srv),
+									ServerPortIndex = portIdx,
+									SwitchID = sw.switchId,
+									SwitchRackPositionUID = GetRackPositionUid((Component)(object)sw),
+									SwitchPortIndex = swPortIdx,
+									PatchPanelID = panel.patchPanelId,
+									PatchPanelRackPositionUID = GetRackPositionUid((Component)(object)panel),
+									PatchNearPortIndex = patchNearIdx,
+									PatchFarPortIndex = patchFarIdx
+								});
+							}
+						}
+					}
+					portIdx++;
+				}
+			}
+			string filePath = Path.Combine(UnityEngine.Application.persistentDataPath, "RackCables.json");
+			string json = JsonSerializer.Serialize(topology, new JsonSerializerOptions { WriteIndented = true });
+			File.WriteAllText(filePath, json);
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Saved {topology.Cables.Count} cables to RackCables.json (servers={servers.Count}, switches={switches.Count}, patchPanels={panels.Count})");
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning($"Failed to save cable topology: {ex.Message}");
+		}
+	}
+
+	/// <summary>
+	/// Restores cable topology from RackCables.json and recreates cables based on the saved mappings.
+	/// Called during AutoWireAllRacksDeferred to rebuild cables that survived the save/reload cycle.
+	/// </summary>
+	private void RestoreCableTopologyFromFile()
+	{
+		try
+		{
+			string filePath = Path.Combine(UnityEngine.Application.persistentDataPath, "RackCables.json");
+			if (!File.Exists(filePath)) return;
+			string json = File.ReadAllText(filePath);
+			var topology = JsonSerializer.Deserialize<CableTopologyData>(json);
+			if (topology?.Cables.Count == 0) return;
+			CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+			if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null) return;
+			var serversById = UnityEngine.Object.FindObjectsOfType<Server>()
+				.Where((Server s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.ServerID) && s.ServerID.StartsWith("Mod_"))
+				.GroupBy((Server s) => s.ServerID)
+				.ToDictionary((IGrouping<string, Server> g) => g.Key, (IGrouping<string, Server> g) => g.First());
+			var serversByRackPositionUid = UnityEngine.Object.FindObjectsOfType<Server>()
+				.Where((Server s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cablelinks != null && IsPlacedRackObject((Component)(object)s))
+				.Select((Server s) => new { Server = s, RackPositionUid = GetRackPositionUid((Component)(object)s) })
+				.Where((x) => x.RackPositionUid > 0)
+				.GroupBy((x) => x.RackPositionUid)
+				.ToDictionary((IGrouping<int, dynamic> g) => g.Key, (IGrouping<int, dynamic> g) => (Server)g.First().Server);
+			var switchesById = UnityEngine.Object.FindObjectsOfType<NetworkSwitch>()
+				.Where((NetworkSwitch s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.switchId) && s.switchId.StartsWith("Mod_"))
+				.GroupBy((NetworkSwitch s) => s.switchId)
+				.ToDictionary((IGrouping<string, NetworkSwitch> g) => g.Key, (IGrouping<string, NetworkSwitch> g) => g.First());
+			var switchesByRackPositionUid = UnityEngine.Object.FindObjectsOfType<NetworkSwitch>()
+				.Where((NetworkSwitch s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s))
+				.Select((NetworkSwitch s) => new { Switch = s, RackPositionUid = GetRackPositionUid((Component)(object)s) })
+				.Where((x) => x.RackPositionUid > 0)
+				.GroupBy((x) => x.RackPositionUid)
+				.ToDictionary((IGrouping<int, dynamic> g) => g.Key, (IGrouping<int, dynamic> g) => (NetworkSwitch)g.First().Switch);
+			var panelsById = UnityEngine.Object.FindObjectsOfType<PatchPanel>()
+				.Where((PatchPanel p) => (UnityEngine.Object)(object)p != (UnityEngine.Object)null && p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p) && !string.IsNullOrEmpty(p.patchPanelId) && p.patchPanelId.StartsWith("Mod_"))
+				.GroupBy((PatchPanel p) => p.patchPanelId)
+				.ToDictionary((IGrouping<string, PatchPanel> g) => g.Key, (IGrouping<string, PatchPanel> g) => g.First());
+			var panelsByRackPositionUid = UnityEngine.Object.FindObjectsOfType<PatchPanel>()
+				.Where((PatchPanel p) => (UnityEngine.Object)(object)p != (UnityEngine.Object)null && p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p))
+				.Select((PatchPanel p) => new { Panel = p, RackPositionUid = GetRackPositionUid((Component)(object)p) })
+				.Where((x) => x.RackPositionUid > 0)
+				.GroupBy((x) => x.RackPositionUid)
+				.ToDictionary((IGrouping<int, dynamic> g) => g.Key, (IGrouping<int, dynamic> g) => (PatchPanel)g.First().Panel);
+			int restored = 0;
+			int restoredByRackPositionFallback = 0;
+			foreach (var cable in topology.Cables)
+			{
+				Server srv = null;
+				NetworkSwitch sw = null;
+				PatchPanel panel = null;
+
+				bool resolvedServerById = !string.IsNullOrEmpty(cable.ServerID) && serversById.TryGetValue(cable.ServerID, out srv);
+				if (!resolvedServerById && cable.ServerRackPositionUID > 0)
+				{
+					serversByRackPositionUid.TryGetValue(cable.ServerRackPositionUID, out srv);
+					resolvedServerById = (UnityEngine.Object)(object)srv != (UnityEngine.Object)null;
+				}
+				bool resolvedSwitchById = !string.IsNullOrEmpty(cable.SwitchID) && switchesById.TryGetValue(cable.SwitchID, out sw);
+				if (!resolvedSwitchById && cable.SwitchRackPositionUID > 0)
+				{
+					switchesByRackPositionUid.TryGetValue(cable.SwitchRackPositionUID, out sw);
+					resolvedSwitchById = (UnityEngine.Object)(object)sw != (UnityEngine.Object)null;
+				}
+				if ((UnityEngine.Object)(object)srv == (UnityEngine.Object)null || (UnityEngine.Object)(object)sw == (UnityEngine.Object)null) continue;
+				if (srv.cablelinks == null || sw.cableLinkSwitchPorts == null) continue;
+				if (cable.ServerPortIndex >= ((Il2CppArrayBase<CableLink>)(object)srv.cablelinks).Length) continue;
+				if (cable.SwitchPortIndex >= ((Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts).Length) continue;
+				CableLink srvPort = ((Il2CppArrayBase<CableLink>)(object)srv.cablelinks)[cable.ServerPortIndex];
+				CableLink swPort = ((Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)[cable.SwitchPortIndex];
+				if ((UnityEngine.Object)(object)srvPort == (UnityEngine.Object)null || (UnityEngine.Object)(object)swPort == (UnityEngine.Object)null) continue;
+
+				if (!string.IsNullOrEmpty(cable.PatchPanelID) && cable.PatchNearPortIndex >= 0 && cable.PatchFarPortIndex >= 0)
+				{
+					bool resolvedPanelById = !string.IsNullOrEmpty(cable.PatchPanelID) && panelsById.TryGetValue(cable.PatchPanelID, out panel);
+					if (!resolvedPanelById && cable.PatchPanelRackPositionUID > 0)
+					{
+						panelsByRackPositionUid.TryGetValue(cable.PatchPanelRackPositionUID, out panel);
+						resolvedPanelById = (UnityEngine.Object)(object)panel != (UnityEngine.Object)null;
+					}
+					if ((UnityEngine.Object)(object)panel == (UnityEngine.Object)null) continue;
+					if (panel.cableLinkPorts == null) continue;
+					if (cable.PatchNearPortIndex >= ((Il2CppArrayBase<CableLink>)(object)panel.cableLinkPorts).Length) continue;
+					if (cable.PatchFarPortIndex >= ((Il2CppArrayBase<CableLink>)(object)panel.cableLinkPorts).Length) continue;
+					CableLink patchNear = ((Il2CppArrayBase<CableLink>)(object)panel.cableLinkPorts)[cable.PatchNearPortIndex];
+					CableLink patchFar = ((Il2CppArrayBase<CableLink>)(object)panel.cableLinkPorts)[cable.PatchFarPortIndex];
+					if ((UnityEngine.Object)(object)patchNear == (UnityEngine.Object)null || (UnityEngine.Object)(object)patchFar == (UnityEngine.Object)null) continue;
+					if (srvPort.cableIDsOnLink <= 0 && patchNear.cableIDsOnLink <= 0 && patchFar.cableIDsOnLink <= 0 && swPort.cableIDsOnLink <= 0)
+					{
+						Rack prevRack = _selectedRack;
+						try
+						{
+							Rack routeRack = ResolveRackForRoute(srvPort, patchNear, patchFar, swPort);
+							if ((UnityEngine.Object)(object)routeRack != (UnityEngine.Object)null)
+								_selectedRack = routeRack;
+							var serverPatchClips = FindCableClips(srvPort, patchNear);
+							var switchPatchClips = FindCableClips(swPort, patchFar);
+							bool ok1 = CreateCable(cp, srvPort, patchNear, serverPatchClips, CableLink.TypeOfLink.Server, CableLink.TypeOfLink.PatchPanel, srv.ServerID);
+							bool ok2 = CreateCable(cp, swPort, patchFar, switchPatchClips, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.PatchPanel, srv.ServerID);
+							if (ok1 && ok2)
+							{
+								restored += 2;
+								if (!resolvedServerById || !resolvedSwitchById || !resolvedPanelById)
+									restoredByRackPositionFallback += 2;
+							}
+						}
+						finally
+						{
+							_selectedRack = prevRack;
+						}
+					}
+					continue;
+				}
+
+				// Only recreate direct links if ports are not already wired.
+				if (srvPort.cableIDsOnLink <= 0 && swPort.cableIDsOnLink <= 0)
+				{
+					Rack prevRack = _selectedRack;
+					try
+					{
+						Rack routeRack = ResolveRackForRoute(srvPort, swPort);
+						if ((UnityEngine.Object)(object)routeRack != (UnityEngine.Object)null)
+							_selectedRack = routeRack;
+						var waypoints = FindCableClips(srvPort, swPort);
+						if (CreateCable(cp, srvPort, swPort, waypoints, CableLink.TypeOfLink.Server, CableLink.TypeOfLink.Switch, srv.ServerID))
+						{
+							restored++;
+							if (!resolvedServerById || !resolvedSwitchById)
+								restoredByRackPositionFallback++;
+						}
+					}
+					finally
+					{
+						_selectedRack = prevRack;
+					}
+				}
+			}
+			if (restored > 0)
+				((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Restored {restored} cables from RackCables.json" + ((restoredByRackPositionFallback > 0) ? $" ({restoredByRackPositionFallback} via rack-position fallback)" : ""));
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning($"Failed to restore cable topology: {ex.Message}");
+		}
+	}
+
+	/// <summary>
+	/// Zeros connectionSpeed on every empty SFP port (no inserted module) across all switches in the scene.
+	/// <summary>
+	/// Clears cableIDsOnLink on any CableLink whose stored cable ID has no corresponding entry in
+	/// CablePositions. This happens after save/reload because the game serializes cableIDsOnLink
+	/// (set by our mod) but not the cable routing data we added to CablePositions. Without this,
+	/// auto-wire skips ports that look occupied but have no visual cable.
+	/// </summary>
+	private void ClearOrphanedCableIds()
+	{
+		CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null) return;
+		int cleared = 0;
+		foreach (CableLink cl in UnityEngine.Object.FindObjectsOfType<CableLink>())
+		{
+			if ((UnityEngine.Object)(object)cl == (UnityEngine.Object)null) continue;
+			int id = cl.cableIDsOnLink;
+			if (id <= 0) continue;
+			// Check whether the cable actually has routing data in CablePositions.
+			bool exists = false;
+			try
+			{
+				var pts = cp.GetCablePositions(id);
+				exists = pts != null && pts.Count >= 2;
+			}
+			catch { }
+			if (!exists)
+			{
+				cl.cableIDsOnLink = -1;
+				cleared++;
+			}
+		}
+		if (cleared > 0)
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Cleared {cleared} orphaned cable IDs before re-wire.");
+	}
+
+	/// Prevents the prefab-baked default speed (often 50G) from being displayed on vacant SFP slots.
+	/// </summary>
+	private void ClearEmptySfpPortSpeeds()
+	{
+		int cleared = 0;
+		foreach (NetworkSwitch sw in UnityEngine.Object.FindObjectsOfType<NetworkSwitch>())
+		{
+			if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null || sw.cableLinkSwitchPorts == null) continue;
+			foreach (CableLink cl in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
+			{
+				if ((UnityEngine.Object)(object)cl == (UnityEngine.Object)null) continue;
+				if (!cl.isSFPPort) continue;
+				if ((UnityEngine.Object)(object)cl.insertedSFP != (UnityEngine.Object)null) continue; // occupied
+				if (cl.cableIDsOnLink > 0) continue; // wired port — don't touch speed
+				if (cl.connectionSpeed != 0f)
+				{
+					cl.connectionSpeed = 0f;
+					cleared++;
+				}
+			}
+		}
+		if (cleared > 0)
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Cleared stale speed on {cleared} empty SFP ports.");
+	}
+
+	/// <summary>Runs the wiring logic for the current _selectedRack without logging to the UI.</summary>
+	private void AutowireRackSilent(ref int wiredCount)
+	{
+		if (_disableAutoWireForDebug) return;
+		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null) return;
+		CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null) return;
+		AutoWireRack(); // reuses all the existing cable-creation logic; skips already-wired ports
 	}
 
 	private IEnumerator ScrubPlacedDeviceCableIds(GameObject go, int frames)
@@ -244,6 +1195,7 @@ public class RackBuilderCore : MelonMod
 			{
 				if ((UnityEngine.Object)(object)cl == (UnityEngine.Object)null) continue;
 				int id = cl.cableIDsOnLink;
+				if (id > 0 && _autoWireProtectedCableIds.Contains(id)) continue; // AutoWire cable — keep it
 				if (id > 0)
 				{
 					// Remove from the global registry so the game stops showing phantom traffic.
@@ -265,6 +1217,7 @@ public class RackBuilderCore : MelonMod
 					{
 						if ((UnityEngine.Object)(object)serverLink == (UnityEngine.Object)null)
 							continue;
+						if (serverLink.cableIDsOnLink > 0 && _autoWireProtectedCableIds.Contains(serverLink.cableIDsOnLink)) continue;
 						serverLink.cableIDsOnLink = -1;
 					}
 				}
@@ -320,6 +1273,7 @@ public class RackBuilderCore : MelonMod
 					{
 						if ((UnityEngine.Object)(object)switchLink == (UnityEngine.Object)null)
 							continue;
+						if (switchLink.cableIDsOnLink > 0 && _autoWireProtectedCableIds.Contains(switchLink.cableIDsOnLink)) continue;
 						switchLink.cableIDsOnLink = -1;
 					}
 				}
@@ -550,6 +1504,7 @@ public class RackBuilderCore : MelonMod
 		{
 			_onDetailPage = false;
 			_selectedRack = null;
+			_pendingBulkClearConfirmation = false;
 			ShowRackList();
 		}
 		else
@@ -561,7 +1516,7 @@ public class RackBuilderCore : MelonMod
 
 	private void ShowRackList()
 	{
-		//IL_010b: Unknown result type (might be due to invalid IL or missing references)
+		if (_suppressUiUpdates) return;
 		//IL_01bf: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0340: Unknown result type (might be due to invalid IL or missing references)
 		//IL_03a2: Unknown result type (might be due to invalid IL or missing references)
@@ -584,6 +1539,7 @@ public class RackBuilderCore : MelonMod
 		//IL_06a4: Unknown result type (might be due to invalid IL or missing references)
 		//IL_06ab: Expected O, but got Unknown
 		ClearContent();
+		_pendingBulkClearConfirmation = false;
 		_allRacks.Clear();
 		Il2CppArrayBase<Rack> val = UnityEngine.Object.FindObjectsOfType<Rack>();
 		foreach (Rack item in val)
@@ -720,6 +1676,19 @@ public class RackBuilderCore : MelonMod
 					{
 						((Graphic)val10).color = new Color(0.15f, 0.4f, 0.15f);
 						colors.highlightedColor = new Color(0.25f, 0.55f, 0.25f);
+						GameObject val12 = new GameObject("Util");
+						val12.transform.SetParent(val9.transform, false);
+						RectTransform val13 = val12.AddComponent<RectTransform>();
+						val13.anchorMin = Vector2.zero;
+						val13.anchorMax = Vector2.one;
+						val13.sizeDelta = Vector2.zero;
+						TextMeshProUGUI val14 = val12.AddComponent<TextMeshProUGUI>();
+						((TMP_Text)val14).text = GetRackUtilizationText(componentInChildren);
+						((TMP_Text)val14).fontSize = 8f;
+						((TMP_Text)val14).alignment = (TextAlignmentOptions)514;
+						((TMP_Text)val14).enableWordWrapping = false;
+						((Graphic)val14).color = new Color(0.9f, 1f, 0.9f);
+						((Graphic)val14).raycastTarget = false;
 						Rack r = componentInChildren;
 						RackMount m = value;
 						((UnityEvent)val11.onClick).AddListener((Action)delegate
@@ -727,25 +1696,26 @@ public class RackBuilderCore : MelonMod
 							if ((UnityEngine.Object)(object)r != (UnityEngine.Object)null)
 							{
 								_selectedRack = r;
+								_pendingBulkClearConfirmation = false;
 								_onDetailPage = true;
 								ShowRackDetail();
 							}
 						});
-						EventTrigger val12 = val9.AddComponent<EventTrigger>();
-						EventTrigger.Entry val13 = new EventTrigger.Entry();
-						val13.eventID = (EventTriggerType)4;
-						((UnityEvent<BaseEventData>)(object)val13.callback).AddListener((Action<BaseEventData>)delegate(BaseEventData data)
+						EventTrigger val15 = val9.AddComponent<EventTrigger>();
+						EventTrigger.Entry val16 = new EventTrigger.Entry();
+						val16.eventID = (EventTriggerType)4;
+						((UnityEvent<BaseEventData>)(object)val16.callback).AddListener((Action<BaseEventData>)delegate(BaseEventData data)
 						{
 							//IL_000c: Unknown result type (might be due to invalid IL or missing references)
 							//IL_0012: Invalid comparison between Unknown and I4
-							PointerEventData val14 = ((Il2CppObjectBase)data).TryCast<PointerEventData>();
-							if (val14 != null && (int)val14.button == 1)
+							PointerEventData val17 = ((Il2CppObjectBase)data).TryCast<PointerEventData>();
+							if (val17 != null && (int)val17.button == 1)
 							{
 								_pendingRemoveMount = m;
 								ShowRackList();
 							}
 						});
-						val12.triggers.Add(val13);
+						val15.triggers.Add(val16);
 					}
 					else
 					{
@@ -766,6 +1736,27 @@ public class RackBuilderCore : MelonMod
 				((Selectable)val11).colors = colors;
 			}
 		}
+	}
+
+	private string GetRackUtilizationText(Rack rack)
+	{
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || rack.positions == null)
+			return "0/0U";
+		int total = ((Il2CppArrayBase<RackPosition>)(object)rack.positions).Length;
+		int used = 0;
+		if (rack.isPositionUsed != null)
+		{
+			for (int i = 0; i < ((Il2CppArrayBase<int>)(object)rack.isPositionUsed).Length; i++)
+			{
+				if (((Il2CppArrayBase<int>)(object)rack.isPositionUsed)[i] != 0)
+					used++;
+			}
+		}
+		if (used < 0)
+			used = 0;
+		if (used > total)
+			used = total;
+		return $"{used}/{total}U";
 	}
 
 	private void ShowRemoveConfirmation()
@@ -898,7 +1889,10 @@ public class RackBuilderCore : MelonMod
 			list.Add(cl);
 			bool isEndpoint = (UnityEngine.Object)(object)cl.parentServer != (UnityEngine.Object)null
 				|| (UnityEngine.Object)(object)cl.parentSwitch != (UnityEngine.Object)null
-				|| (UnityEngine.Object)(object)cl.parentPatchPanel != (UnityEngine.Object)null;
+				|| (UnityEngine.Object)(object)cl.parentPatchPanel != (UnityEngine.Object)null
+				|| cl.CustomerID >= 0
+				|| cl.isStartOrEnd
+				|| cl.isEndPoint;
 			if (isEndpoint)
 			{
 				endpointCount[id] = endpointCount.TryGetValue(id, out int ep) ? ep + 1 : 1;
@@ -1061,6 +2055,27 @@ public class RackBuilderCore : MelonMod
 			}
 			startPort.cableIDsOnLink = cableId;
 			endPort.cableIDsOnLink = cableId;
+			_autoWireProtectedCableIds.Add(cableId);
+			startPort.isStartOrEnd = true;
+			startPort.isEndPoint = true;
+			endPort.isStartOrEnd = true;
+			endPort.isEndPoint = true;
+			startPort.typeOfLink = startType;
+			endPort.typeOfLink = endType;
+			float aSpeed = ((startPort.isSFPPort && (UnityEngine.Object)(object)startPort.insertedSFP != (UnityEngine.Object)null) ? startPort.insertedSFP.speed : startPort.connectionSpeed);
+			float bSpeed = ((endPort.isSFPPort && (UnityEngine.Object)(object)endPort.insertedSFP != (UnityEngine.Object)null) ? endPort.insertedSFP.speed : endPort.connectionSpeed);
+			float cableSpeed = 0f;
+			if (aSpeed > 0f && bSpeed > 0f)
+				cableSpeed = Math.Min(aSpeed, bSpeed);
+			else if (aSpeed > 0f)
+				cableSpeed = aSpeed;
+			else if (bSpeed > 0f)
+				cableSpeed = bSpeed;
+			if (cableSpeed > 0f)
+			{
+				startPort.connectionSpeed = cableSpeed;
+				endPort.connectionSpeed = cableSpeed;
+			}
 			return true;
 		}
 		catch
@@ -1109,6 +2124,44 @@ public class RackBuilderCore : MelonMod
 		return -1;
 	}
 
+	private static int GetSwitchPortIndex(CableLink switchPort)
+	{
+		if ((UnityEngine.Object)(object)switchPort == (UnityEngine.Object)null || (UnityEngine.Object)(object)switchPort.parentSwitch == (UnityEngine.Object)null || switchPort.parentSwitch.cableLinkSwitchPorts == null)
+			return -1;
+		int idx = 0;
+		foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)switchPort.parentSwitch.cableLinkSwitchPorts)
+		{
+			if ((UnityEngine.Object)(object)port == (UnityEngine.Object)null)
+			{
+				idx++;
+				continue;
+			}
+			if (((UnityEngine.Object)(object)port).GetInstanceID() == ((UnityEngine.Object)(object)switchPort).GetInstanceID())
+				return idx;
+			idx++;
+		}
+		return -1;
+	}
+
+	private static int GetPatchPanelPortIndex(CableLink patchPort)
+	{
+		if ((UnityEngine.Object)(object)patchPort == (UnityEngine.Object)null || (UnityEngine.Object)(object)patchPort.parentPatchPanel == (UnityEngine.Object)null || patchPort.parentPatchPanel.cableLinkPorts == null)
+			return -1;
+		int idx = 0;
+		foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)patchPort.parentPatchPanel.cableLinkPorts)
+		{
+			if ((UnityEngine.Object)(object)port == (UnityEngine.Object)null)
+			{
+				idx++;
+				continue;
+			}
+			if (((UnityEngine.Object)(object)port).GetInstanceID() == ((UnityEngine.Object)(object)patchPort).GetInstanceID())
+				return idx;
+			idx++;
+		}
+		return -1;
+	}
+
 	private static int GetSwitchInstanceId(CableLink port)
 	{
 		if ((UnityEngine.Object)(object)port == (UnityEngine.Object)null || (UnityEngine.Object)(object)port.parentSwitch == (UnityEngine.Object)null)
@@ -1143,7 +2196,7 @@ public class RackBuilderCore : MelonMod
 
 	private void ShowRackDetail()
 	{
-		//IL_1343: Unknown result type (might be due to invalid IL or missing references)
+		if (_suppressUiUpdates) return;
 		//IL_139a: Unknown result type (might be due to invalid IL or missing references)
 		//IL_01eb: Unknown result type (might be due to invalid IL or missing references)
 		//IL_01e4: Unknown result type (might be due to invalid IL or missing references)
@@ -1362,7 +2415,33 @@ public class RackBuilderCore : MelonMod
 					ShowRackDetail();
 				});
 			}
+			AddClickableRow("  BULK REMOVE - Clear entire rack", new Color(0.45f, 0.15f, 0.15f), delegate
+			{
+				_pendingBulkClearConfirmation = true;
+				ShowRackDetail();
+			});
+			if (_pendingBulkClearConfirmation)
+			{
+				AddColorLabel("  Confirm remove ALL installed equipment from this rack?", new Color(1f, 0.7f, 0.3f));
+				AddClickableRow("  YES - Remove all equipment", new Color(0.55f, 0.15f, 0.15f), delegate
+				{
+					int removed = RemoveAllItemsFromSelectedRack();
+					_pendingBulkClearConfirmation = false;
+					((MelonBase)this).LoggerInstance.Msg($"Bulk remove complete: removed {removed} installed items");
+					ShowRackDetail();
+					MelonCoroutines.Start(RefreshRackDetailDeferred(2));
+				});
+				AddClickableRow("  NO - Cancel bulk remove", new Color(0.2f, 0.2f, 0.2f), delegate
+				{
+					_pendingBulkClearConfirmation = false;
+					ShowRackDetail();
+				});
+			}
 			AddSpacer();
+		}
+		else
+		{
+			_pendingBulkClearConfirmation = false;
 		}
 		AddDivider();
 		AddColorLabel("  Networking", new Color(1f, 0.8f, 0.3f));
@@ -1464,6 +2543,14 @@ public class RackBuilderCore : MelonMod
 				AutoFillSfpModules();
 			});
 		}
+		string selectedRackRole = GetRackRole(_selectedRack);
+		AddSpacer();
+		AddColorLabel($"  Rack Role: {selectedRackRole.ToUpperInvariant()}", Color.white);
+		AddClickableRow($"  TOGGLE ROLE - Set as {(selectedRackRole == RackRoleNetwork ? "SERVER" : "NETWORK")} rack", new Color(0.2f, 0.25f, 0.4f), delegate
+		{
+			ToggleRackRole(_selectedRack);
+			ShowRackDetail();
+		});
 		int num15 = 0;
 		foreach (NetworkSwitch sw3 in rackSwitches)
 		{
@@ -1497,7 +2584,10 @@ public class RackBuilderCore : MelonMod
 			return;
 		}
 		AddSpacer();
-		AddColorLabel($"  Connect to Customer:  ({num15} switches need uplink)", Color.white);
+		if (selectedRackRole == RackRoleNetwork)
+			AddColorLabel($"  Connect Network Rack to Customer: ({num15} switches need uplink)", Color.white);
+		else
+			AddColorLabel($"  Connect Server Rack via Network Rack to Customer: ({num15} source switches)", Color.white);
 		bool flag4 = false;
 		foreach (CustomerBase item15 in val6)
 		{
@@ -1535,10 +2625,20 @@ public class RackBuilderCore : MelonMod
 			catch
 			{
 			}
-			AddClickableRow($"    {value3} ({num21} free ports)", new Color(0.1f, 0.3f, 0.4f), delegate
+			if (selectedRackRole == RackRoleNetwork)
 			{
-				AutoWireToCustomer(baseId);
-			});
+				AddClickableRow($"    {value3} ({num21} free ports)", new Color(0.1f, 0.3f, 0.4f), delegate
+				{
+					AutoWireToCustomer(baseId);
+				});
+			}
+			else
+			{
+				AddClickableRow($"    {value3} via nearest NETWORK rack ({num21} free ports)", new Color(0.1f, 0.35f, 0.3f), delegate
+				{
+					AutoWireServerRackToCustomerViaNetwork(baseId);
+				});
+			}
 			flag4 = true;
 		}
 		if (!flag4)
@@ -1585,73 +2685,92 @@ public class RackBuilderCore : MelonMod
 	{
 		int num = -1;
 		float num2 = -1f;
+		int num3 = -1;
+		float num4 = float.MaxValue;
 		for (int i = 0; i < list.Count; i++)
 		{
 			(int, float, int, string) tuple = list[i];
-			if (tuple.Item1 == requiredType && tuple.Item2 > num2)
+			if (tuple.Item1 != requiredType)
+				continue;
+			float speed = tuple.Item2;
+			if (requiredSpeed > 0f)
 			{
-				num2 = tuple.Item2;
+				if (speed <= requiredSpeed + 0.01f && speed > num2)
+				{
+					num2 = speed;
+					num = tuple.Item3;
+				}
+				float over = speed - requiredSpeed;
+				if (over > 0f && over < num4)
+				{
+					num4 = over;
+					num3 = tuple.Item3;
+				}
+			}
+			else if (speed > num2)
+			{
+				num2 = speed;
 				num = tuple.Item3;
 			}
 		}
 		if (num >= 0)
-		{
 			return num;
-		}
+		if (num3 >= 0)
+			return num3;
 		if (list.Count == 0)
 		{
 			return -1;
 		}
 		string text = ((requiredSpeed >= 35f) ? "qsfp" : ((!(requiredSpeed >= 20f)) ? "sfp+" : "sfp28"));
-		int num3 = -1;
-		int num4 = -1;
 		int num5 = -1;
+		int num6 = -1;
+		int num7 = -1;
 		for (int j = 0; j < list.Count; j++)
 		{
 			(int, float, int, string) tuple2 = list[j];
 			string text2 = (tuple2.Item4 ?? "").ToLowerInvariant();
 			if (text2.Contains("qsfp"))
 			{
-				if (num3 < 0)
+				if (num5 < 0)
 				{
-					num3 = tuple2.Item3;
+					num5 = tuple2.Item3;
 				}
 			}
 			else if (text2.Contains("sfp28") || text2.Contains("sfp_28"))
 			{
-				if (num4 < 0)
+				if (num6 < 0)
 				{
-					num4 = tuple2.Item3;
+					num6 = tuple2.Item3;
 				}
 			}
-			else if (text2.Contains("sfp") && num5 < 0)
+			else if (text2.Contains("sfp") && num7 < 0)
 			{
-				num5 = tuple2.Item3;
+				num7 = tuple2.Item3;
 			}
 		}
-		if (text == "qsfp" && num3 >= 0)
-		{
-			return num3;
-		}
-		if (text == "sfp28" && num4 >= 0)
-		{
-			return num4;
-		}
-		if (text == "sfp+" && num5 >= 0)
+		if (text == "qsfp" && num5 >= 0)
 		{
 			return num5;
+		}
+		if (text == "sfp28" && num6 >= 0)
+		{
+			return num6;
+		}
+		if (text == "sfp+" && num7 >= 0)
+		{
+			return num7;
 		}
 		if (text == "qsfp")
 		{
-			return (num3 >= 0) ? num3 : ((num4 >= 0) ? num4 : num5);
+			return (num5 >= 0) ? num5 : ((num6 >= 0) ? num6 : num7);
 		}
-		if (num5 >= 0)
+		if (num7 >= 0)
 		{
-			return num5;
+			return num7;
 		}
-		if (num4 >= 0)
+		if (num6 >= 0)
 		{
-			return num4;
+			return num6;
 		}
 		return -1;
 	}
@@ -1712,13 +2831,14 @@ public class RackBuilderCore : MelonMod
 
 	private float DeriveExpectedPortSpeed(NetworkSwitch sw, int portIndex, CableLink port)
 	{
-		if ((UnityEngine.Object)(object)port != (UnityEngine.Object)null && port.connectionSpeed > 0.5f)
-		{
-			return port.connectionSpeed;
-		}
 		if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null || (UnityEngine.Object)(object)port == (UnityEngine.Object)null)
 		{
 			return 0f;
+		}
+		// Ignore stale prefab/default connectionSpeed on empty SFP ports.
+		if (port.connectionSpeed > 0.5f && (!port.isSFPPort || (UnityEngine.Object)(object)port.insertedSFP != (UnityEngine.Object)null))
+		{
+			return port.connectionSpeed;
 		}
 		Dictionary<int, float> dictionary = BuildSwitchPortTypeSpeedMap(sw);
 		if (dictionary.TryGetValue(port.sfpTypeSupported, out var value))
@@ -1774,9 +2894,13 @@ public class RackBuilderCore : MelonMod
 						continue;
 					}
 					GameObject val3 = ((Il2CppArrayBase<GameObject>)(object)val.sfpPrefabs)[prefabIdx];
+					float targetSpeed = num4;
+					string prefabName = ((UnityEngine.Object)val3).name.ToLowerInvariant();
+					if (prefabName.Contains("rj45") && (targetSpeed <= 0f || targetSpeed > 10f))
+						targetSpeed = 10f;
 					if (_enableVerboseDiagnostics)
 					{
-						((MelonBase)this).LoggerInstance.Msg($"  Port {((UnityEngine.Object)((Component)val2).gameObject).name}[#{num3}] switchType={val2.switchType} portConnSpeed={item2.connectionSpeed} ? need speed={num4} ? prefab[{prefabIdx}] {((UnityEngine.Object)val3).name} (speed={list.Find(((int sfpType, float speed, int prefabIdx, string name) x) => x.prefabIdx == prefabIdx).Item2})");
+						((MelonBase)this).LoggerInstance.Msg($"  Port {((UnityEngine.Object)((Component)val2).gameObject).name}[#{num3}] switchType={val2.switchType} portConnSpeed={item2.connectionSpeed} ? need speed={targetSpeed} ? prefab[{prefabIdx}] {((UnityEngine.Object)val3).name} (speed={list.Find(((int sfpType, float speed, int prefabIdx, string name) x) => x.prefabIdx == prefabIdx).Item2})");
 					}
 					GameObject val4 = UnityEngine.Object.Instantiate<GameObject>(val3, val.parentUsableObjects);
 					SFPModule val5 = val4.GetComponent<SFPModule>() ?? val4.GetComponentInChildren<SFPModule>();
@@ -1789,8 +2913,18 @@ public class RackBuilderCore : MelonMod
 					else
 					{
 						val5.sfpType = sfpTypeSupported;
-						val5.speed = ((num4 > 0f) ? num4 : val5.speed);
+						val5.speed = ((targetSpeed > 0f) ? targetSpeed : val5.speed);
+						if (targetSpeed > 0f)
+							item2.connectionSpeed = targetSpeed;
 						val5.InsertDirectlyIntoPort(item2);
+						// Immediately overwrite whatever InsertDirectlyIntoPort reset the speed to.
+						if (targetSpeed > 0f)
+						{
+							val5.speed = targetSpeed;
+							item2.connectionSpeed = targetSpeed;
+							// Also enforce each frame for 10 frames in case the game re-syncs async.
+							MelonCoroutines.Start(EnforceSfpSpeedDeferred(val5, item2, targetSpeed, 10));
+						}
 						num++;
 					}
 				}
@@ -1827,6 +2961,28 @@ public class RackBuilderCore : MelonMod
 		List<Server> rackServers = ExtractRackServers(rackUsableObjects);
 		List<NetworkSwitch> rackSwitches = ExtractRackSwitches(rackUsableObjects);
 		List<PatchPanel> rackPatchPanels = ExtractRackPatchPanels(rackUsableObjects);
+
+		// Clear any ghost cable IDs that ServerInsertedInRack may have assigned to server ports.
+		// These are unprotected positive IDs the game re-assigns between placement and auto-wire,
+		// causing IsPortReadyForCable to falsely skip the port (most visible on the last placed server).
+		int ghostsCleared = 0;
+		foreach (Server ghostSrv in rackServers)
+		{
+			if ((UnityEngine.Object)(object)ghostSrv == (UnityEngine.Object)null || ghostSrv.cablelinks == null) continue;
+			foreach (CableLink gcl in (Il2CppArrayBase<CableLink>)(object)ghostSrv.cablelinks)
+			{
+				if ((UnityEngine.Object)(object)gcl == (UnityEngine.Object)null) continue;
+				int gid = gcl.cableIDsOnLink;
+				if (gid > 0 && !_autoWireProtectedCableIds.Contains(gid))
+				{
+					gcl.cableIDsOnLink = -1;
+					ghostsCleared++;
+				}
+			}
+		}
+		if (ghostsCleared > 0)
+			((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack] Cleared {ghostsCleared} ghost server port cable IDs before wiring");
+
 		List<CableLink> list = new List<CableLink>();
 		foreach (Server componentInChildren in rackServers)
 		{
@@ -1896,6 +3052,13 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 		List<int> patchPanelOrder = patchPairs.Select(((CableLink nearPort, CableLink farPort, int panelId) p) => p.panelId).Distinct().ToList();
+		patchPanelOrder.Sort();
+		List<int> orderedSwitchIds = list2
+			.Select((CableLink p) => GetSwitchInstanceId(p))
+			.Where((int id) => id > 0)
+			.Distinct()
+			.OrderBy((int id) => id)
+			.ToList();
 		Dictionary<int, int> switchUsage = new Dictionary<int, int>();
 		((MelonBase)this).LoggerInstance.Msg($"Auto-wire: {list.Count} server ports, {list2.Count} switch ports");
 		int num = 0;
@@ -1903,6 +3066,7 @@ public class RackBuilderCore : MelonMod
 		{
 			bool routedViaPatchPanel = false;
 			int serverPortIndex = GetServerPortIndex(item6);
+			int preferredGroup = (serverPortIndex >= 0) ? (serverPortIndex % 2) : 0; // 0=A, 1=B
 			int preferredPanelId = (patchPanelOrder.Count > 0 && serverPortIndex >= 0) ? patchPanelOrder[serverPortIndex % patchPanelOrder.Count] : -1;
 			for (int pass = 0; pass < 2 && !routedViaPatchPanel; pass++)
 			{
@@ -1931,7 +3095,23 @@ public class RackBuilderCore : MelonMod
 					}
 					if (!PortsCompatible(item6, patchNear))
 						continue;
-					CableLink switchPortCandidate = PickBestSwitchPort(patchFar, list2, switchUsage, (CableLink candidate) => PortsCompatible(patchFar, candidate));
+					CableLink switchPortCandidate = PickBestSwitchPort(patchFar, list2, switchUsage, delegate(CableLink candidate)
+					{
+						if (!PortsCompatible(patchFar, candidate))
+							return false;
+						int swIdCandidate = GetSwitchInstanceId(candidate);
+						if (orderedSwitchIds.Count >= 2 && swIdCandidate > 0)
+						{
+							int idx = orderedSwitchIds.IndexOf(swIdCandidate);
+							if (idx >= 0)
+							{
+								bool groupMatch = (idx % 2) == preferredGroup;
+								if (!groupMatch && pass == 0)
+									return false;
+							}
+						}
+						return true;
+					});
 					if ((UnityEngine.Object)(object)switchPortCandidate == (UnityEngine.Object)null)
 						continue;
 					float score = distNear;
@@ -1953,7 +3133,23 @@ public class RackBuilderCore : MelonMod
 					patchNear2 = bestPair.farPort;
 					patchFar2 = bestPair.nearPort;
 				}
-				CableLink switchPort = PickBestSwitchPort(patchFar2, list2, switchUsage, (CableLink candidate) => PortsCompatible(patchFar2, candidate));
+				CableLink switchPort = PickBestSwitchPort(patchFar2, list2, switchUsage, delegate(CableLink candidate)
+				{
+					if (!PortsCompatible(patchFar2, candidate))
+						return false;
+					int swIdCandidate = GetSwitchInstanceId(candidate);
+					if (orderedSwitchIds.Count >= 2 && swIdCandidate > 0)
+					{
+						int idx = orderedSwitchIds.IndexOf(swIdCandidate);
+						if (idx >= 0)
+						{
+							bool groupMatch = (idx % 2) == preferredGroup;
+							if (!groupMatch && pass == 0)
+								return false;
+						}
+					}
+					return true;
+				});
 				if ((UnityEngine.Object)(object)switchPort == (UnityEngine.Object)null)
 					continue;
 				try
@@ -1990,8 +3186,14 @@ public class RackBuilderCore : MelonMod
 				CableLink val4 = list2[j];
 				if (!IsPortReadyForCable(val4) || !PortsCompatible(item6, val4))
 					continue;
-				float d = (((Component)val4).transform.position - ((Component)item6).transform.position).sqrMagnitude;
 				int swId = GetSwitchInstanceId(val4);
+				if (orderedSwitchIds.Count >= 2 && swId > 0)
+				{
+					int idx = orderedSwitchIds.IndexOf(swId);
+					if (idx >= 0 && (idx % 2) != preferredGroup)
+						continue;
+				}
+				float d = (((Component)val4).transform.position - ((Component)item6).transform.position).sqrMagnitude;
 				int used = (swId > 0 && switchUsage.TryGetValue(swId, out int cnt)) ? cnt : 0;
 				float score = d + used * 25f;
 				if (score < bestDirectDist)
@@ -2003,8 +3205,27 @@ public class RackBuilderCore : MelonMod
 			}
 			if ((UnityEngine.Object)(object)val3 == (UnityEngine.Object)null)
 			{
-				((MelonBase)this).LoggerInstance.Msg($"  No compatible switch port for server port (fibre={item6.isFibrePort}, sfp={item6.isSFPPort}, type={item6.sfpTypeSupported})");
-				continue;
+				for (int j = 0; j < list2.Count; j++)
+				{
+					CableLink val4 = list2[j];
+					if (!IsPortReadyForCable(val4) || !PortsCompatible(item6, val4))
+						continue;
+					float d = (((Component)val4).transform.position - ((Component)item6).transform.position).sqrMagnitude;
+					int swId = GetSwitchInstanceId(val4);
+					int used = (swId > 0 && switchUsage.TryGetValue(swId, out int cnt)) ? cnt : 0;
+					float score = d + used * 25f;
+					if (score < bestDirectDist)
+					{
+						bestDirectDist = score;
+						val3 = val4;
+						value = j;
+					}
+				}
+				if ((UnityEngine.Object)(object)val3 == (UnityEngine.Object)null)
+				{
+					((MelonBase)this).LoggerInstance.Msg($"  No compatible switch port for server port (fibre={item6.isFibrePort}, sfp={item6.isSFPPort}, type={item6.sfpTypeSupported})");
+					continue;
+				}
 			}
 			try
 			{
@@ -2025,6 +3246,7 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 		((MelonBase)this).LoggerInstance.Msg($"Auto-wire complete: {num} connections made");
+		SaveCableTopology();
 		ShowRackDetail();
 		static bool PortsCompatible(CableLink s, CableLink sw)
 		{
@@ -2311,134 +3533,13 @@ public class RackBuilderCore : MelonMod
 			((MelonBase)this).LoggerInstance.Msg($"AutoWireToCustomer is disabled by debug flag (target {targetBaseId})");
 			return;
 		}
-
-		//IL_053c: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0548: Unknown result type (might be due to invalid IL or missing references)
-		//IL_054d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0552: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0198: Unknown result type (might be due to invalid IL or missing references)
-		//IL_019d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_042b: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0430: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0433: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0435: Unknown result type (might be due to invalid IL or missing references)
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
 		{
 			return;
 		}
-		CablePositions val = UnityEngine.Object.FindObjectOfType<CablePositions>();
-		if ((UnityEngine.Object)(object)val == (UnityEngine.Object)null)
-		{
-			((MelonBase)this).LoggerInstance.Error("CablePositions not found");
-			return;
-		}
-		CustomerBase val2 = null;
-		foreach (CustomerBase item in UnityEngine.Object.FindObjectsOfType<CustomerBase>())
-		{
-			if ((UnityEngine.Object)(object)item != (UnityEngine.Object)null && item.customerBaseID == targetBaseId)
-			{
-				val2 = item;
-				break;
-			}
-		}
-		if ((UnityEngine.Object)(object)val2 == (UnityEngine.Object)null || val2.cableLinks == null)
-		{
-			((MelonBase)this).LoggerInstance.Error($"CustomerBase {targetBaseId} not found");
-			ShowRackDetail();
-			return;
-		}
-		List<CableLink> list = new List<CableLink>();
-		foreach (CableLink item2 in (Il2CppArrayBase<CableLink>)(object)val2.cableLinks)
-		{
-			if (IsPortReadyForCable(item2))
-			{
-				list.Add(item2);
-			}
-		}
-		if (list.Count == 0)
-		{
-			((MelonBase)this).LoggerInstance.Msg("No free customer ports on this base");
-			ShowRackDetail();
-			return;
-		}
-		Vector3 position = ((Component)val2).transform.position;
-		List<CableLink> list2 = new List<CableLink>();
-		foreach (NetworkSwitch val3 in CollectRackSwitches())
-		{
-			if ((UnityEngine.Object)(object)val3 == (UnityEngine.Object)null || val3.cableLinkSwitchPorts == null)
-			{
-				continue;
-			}
-			CableLink val4 = null;
-			foreach (CableLink item4 in (Il2CppArrayBase<CableLink>)(object)val3.cableLinkSwitchPorts)
-			{
-				if (!IsPortReadyForCable(item4))
-				{
-					continue;
-				}
-				bool flag = false;
-				foreach (CableLink item5 in list)
-				{
-					if (!IsPortReadyForCable(item5) || item5.isFibrePort != item4.isFibrePort)
-					{
-						continue;
-					}
-					flag = true;
-					break;
-				}
-				if (!flag)
-				{
-					continue;
-				}
-				val4 = item4;
-				break;
-			}
-			if ((UnityEngine.Object)(object)val4 != (UnityEngine.Object)null)
-			{
-				list2.Add(val4);
-			}
-		}
-		if (list2.Count == 0)
-		{
-			((MelonBase)this).LoggerInstance.Msg("No compatible switch ports for this customer's port types");
-			ShowRackDetail();
-			return;
-		}
-		((MelonBase)this).LoggerInstance.Msg($"AutoWireToCustomer: {list2.Count} switch ports, {list.Count} customer ports");
-		Vector3 position2 = ((Component)_selectedRack).transform.position;
-		List<Transform> list3 = BuildOverheadPath(position2, position);
-		int num = 0;
-		foreach (CableLink item6 in list2)
-		{
-			CableLink val5 = null;
-			foreach (CableLink item7 in list)
-			{
-				if (!IsPortReadyForCable(item7) || item7.isFibrePort != item6.isFibrePort)
-				{
-					continue;
-				}
-				val5 = item7;
-				break;
-			}
-			if ((UnityEngine.Object)(object)val5 == (UnityEngine.Object)null)
-			{
-				continue;
-			}
-			try
-			{
-				List<Transform> waypoints = new List<Transform>();
-				waypoints.AddRange(BuildRackExitPath(item6));
-				foreach (Transform item9 in list3)
-					waypoints.Add(item9);
-				if (CreateCable(val, item6, val5, waypoints, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.Base, ""))
-					num++;
-			}
-			catch (Exception ex)
-			{
-				((MelonBase)this).LoggerInstance.Error("  Customer wire failed: " + ex.Message);
-			}
-		}
-		((MelonBase)this).LoggerInstance.Msg($"AutoWireToCustomer complete: {num} cables routed through {list3.Count} overhead waypoints");
+		int num = WireRackSwitchesToCustomer(_selectedRack, targetBaseId);
+		((MelonBase)this).LoggerInstance.Msg($"AutoWireToCustomer complete: {num} cables");
+		SaveCableTopology();
 		ShowRackDetail();
 	}
 
@@ -2844,6 +3945,16 @@ public class RackBuilderCore : MelonMod
 							((MelonBase)this).LoggerInstance.Msg("Called SwitchInsertedInRack");
 							LogPlacementDebugState("after-switch-insert", null, component5);
 							component5.isOn = false;
+							// Zero out stale prefab speeds on empty SFP ports immediately after insert.
+							if (component5.cableLinkSwitchPorts != null)
+							{
+								foreach (CableLink sfpCl in (Il2CppArrayBase<CableLink>)(object)component5.cableLinkSwitchPorts)
+								{
+									if ((UnityEngine.Object)(object)sfpCl != (UnityEngine.Object)null && sfpCl.isSFPPort
+										&& (UnityEngine.Object)(object)sfpCl.insertedSFP == (UnityEngine.Object)null)
+										sfpCl.connectionSpeed = 0f;
+								}
+							}
 							scrubServerOrSwitchCables = true;
 						}
 						if ((UnityEngine.Object)(object)component6 != (UnityEngine.Object)null)
@@ -3263,6 +4374,68 @@ public class RackBuilderCore : MelonMod
 		}
 		UnityEngine.Object.Destroy((UnityEngine.Object)(object)((Component)val2).gameObject);
 		((MelonBase)this).LoggerInstance.Msg($"Removed {((UnityEngine.Object)((Component)val2).gameObject).name} ? anchor U{anchorIdx + 1}, range U{num + 1}?U{num + size} ({size}U)");
+	}
+
+	private int RemoveAllItemsFromSelectedRack()
+	{
+		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null || _selectedRack.positions == null)
+		{
+			return 0;
+		}
+		Dictionary<int, int> rpInstanceToSlot = new Dictionary<int, int>();
+		Dictionary<int, int> rpUidToSlot = new Dictionary<int, int>();
+		for (int i = 0; i < ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions).Length; i++)
+		{
+			RackPosition rp = ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions)[i];
+			if ((UnityEngine.Object)(object)rp == (UnityEngine.Object)null)
+				continue;
+			rpInstanceToSlot[((Component)rp).gameObject.GetInstanceID()] = i;
+			if (rp.rackPosGlobalUID > 0)
+				rpUidToSlot[rp.rackPosGlobalUID] = i;
+		}
+		HashSet<int> seenAnchors = new HashSet<int>();
+		List<(int anchor, int size)> toRemove = new List<(int anchor, int size)>();
+		foreach (UsableObject uo in CollectRackUsableObjects())
+		{
+			if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null)
+				continue;
+			if ((UnityEngine.Object)(object)((Component)uo).GetComponent<SFPModule>() != (UnityEngine.Object)null)
+				continue;
+			int anchor = -1;
+			if ((UnityEngine.Object)(object)uo.currentRackPosition != (UnityEngine.Object)null)
+			{
+				rpInstanceToSlot.TryGetValue(((Component)uo.currentRackPosition).gameObject.GetInstanceID(), out anchor);
+			}
+			if (anchor < 0 && uo.rackPositionUID > 0)
+			{
+				rpUidToSlot.TryGetValue(uo.rackPositionUID, out anchor);
+			}
+			if (anchor < 0)
+			{
+				anchor = uo.storedPosition;
+			}
+			if (anchor < 0 || anchor >= ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions).Length)
+				continue;
+			if (!seenAnchors.Add(anchor))
+				continue;
+			int size = (uo.sizeInU > 0) ? uo.sizeInU : 1;
+			toRemove.Add((anchor, size));
+		}
+		toRemove.Sort((a, b) => b.anchor.CompareTo(a.anchor));
+		int removed = 0;
+		foreach ((int anchor, int size) entry in toRemove)
+		{
+			try
+			{
+				RemoveItemByAnchor(entry.anchor, entry.size);
+				removed++;
+			}
+			catch (Exception ex)
+			{
+				((MelonBase)this).LoggerInstance.Warning($"Bulk remove skipped anchor U{entry.anchor + 1}: {ex.Message}");
+			}
+		}
+		return removed;
 	}
 
 	private static string DescribeUsableObject(UsableObject uo)
