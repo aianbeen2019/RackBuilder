@@ -2,6 +2,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Diagnostics;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -94,6 +95,47 @@ public class RackBuilderCore : MelonMod
 
 	private bool _integrated;
 	private bool _startupCableRestoreQueued;
+	private int _nextStartupRestoreCheckFrame;
+	private int _nextStartupTopologyCheckFrame;
+	private int _nextPerformanceHeartbeatFrame;
+	private CablePositions _cachedCablePositions;
+	private readonly List<Rack> _cachedRackSnapshot = new List<Rack>();
+	private float _cachedRackSnapshotTime = -999f;
+	private readonly List<CustomerBase> _cachedCustomerSnapshot = new List<CustomerBase>();
+	private float _cachedCustomerSnapshotTime = -999f;
+	private const float SnapshotCacheTtlSeconds = 5f;  // racks/customers rarely change during play
+
+	// Deferred save state — prevents multiple rapid saves from stacking 235ms hits.
+	private bool _saveTopologyPending;
+	private int _pendingSaveDelayFrames;
+
+	// Server / switch / panel caches — share TTL with rack/customer snapshots
+	private readonly List<Server> _cachedServers = new List<Server>();
+	private float _cachedServersTime = -999f;
+	private readonly List<NetworkSwitch> _cachedNetworkSwitches = new List<NetworkSwitch>();
+	private float _cachedNetworkSwitchesTime = -999f;
+	private readonly List<PatchPanel> _cachedPatchPanels = new List<PatchPanel>();
+	private float _cachedPatchPanelsTime = -999f;
+
+	// Wall / mount caches — static scene objects, rarely change
+	private readonly List<Wall> _cachedWalls = new List<Wall>();
+	private float _cachedWallsTime = -999f;
+	private readonly List<RackMount> _cachedMounts = new List<RackMount>();
+	private float _cachedMountsTime = -999f;
+	private const float StaticObjectCacheTtlSeconds = 30f;
+
+	// MainGameManager singleton — never changes after startup, safe to cache permanently
+	private MainGameManager _cachedGameManager;
+
+	// UsableObject snapshot — needed for Pass 3 fallback in ShowRackDetail
+	private readonly List<UsableObject> _cachedUsableObjects = new List<UsableObject>();
+	private float _cachedUsableObjectsTime = -999f;
+
+	private const int StartupRestoreCheckIntervalFrames = 120;  // check every ~2s, not every 0.5s
+	private const int StartupTopologyCheckIntervalFrames = 360; // topology check every ~6s
+	private const int PerformanceHeartbeatIntervalFrames = 600;
+	private const long SlowUpdateThresholdMs = 8L;
+	private const long SlowPathThresholdMs = 4L;
 
 	// Fingerprint of rack instance IDs at last UI open ? used to detect same-scene save reloads
 	private HashSet<int> _lastRackIds = new HashSet<int>();
@@ -211,9 +253,16 @@ public class RackBuilderCore : MelonMod
 		}
 	}
 
+	private void LogPerformanceEvent(string tag, long elapsedMs, string details = "", long thresholdMs = SlowPathThresholdMs)
+	{
+		if (elapsedMs < thresholdMs)
+			return;
+		((MelonBase)this).LoggerInstance.Msg($"[Perf]{tag} {elapsedMs}ms{details}");
+	}
+
 	public override void OnInitializeMelon()
 	{
-		((MelonBase)this).LoggerInstance.Msg("Rack Builder Mod v1.1.1 initialized!");
+		((MelonBase)this).LoggerInstance.Msg("Rack Builder Mod v1.1.2a initialized!");
 	}
 
 	public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -256,32 +305,105 @@ public class RackBuilderCore : MelonMod
 		_autoWireProtectedCableIds.Clear();
 		_suppressUiUpdates = false;
 		_startupCableRestoreQueued = false;
+		_nextStartupRestoreCheckFrame = 0;
+		_nextStartupTopologyCheckFrame = 0;
+		_cachedCablePositions = null;
+		_cachedRackSnapshot.Clear();
+		_cachedRackSnapshotTime = -999f;
+		_cachedCustomerSnapshot.Clear();
+		_cachedCustomerSnapshotTime = -999f;
+		_cachedServers.Clear(); _cachedServersTime = -999f;
+		_cachedNetworkSwitches.Clear(); _cachedNetworkSwitchesTime = -999f;
+		_cachedPatchPanels.Clear(); _cachedPatchPanelsTime = -999f;
+		_cachedWalls.Clear(); _cachedWallsTime = -999f;
+		_cachedMounts.Clear(); _cachedMountsTime = -999f;
+		_cachedGameManager = null;
+		_cachedUsableObjects.Clear(); _cachedUsableObjectsTime = -999f;
+		_saveTopologyPending = false;
+		_pendingSaveDelayFrames = 0;
+	}
+
+	/// <summary>
+	/// Schedules a topology save to run after a short delay, coalescing rapid consecutive saves
+	/// into a single 235ms disk write instead of one per wire action.
+	/// </summary>
+	private void QueueSaveTopology(int delayFrames = 60)
+	{
+		_pendingSaveDelayFrames = delayFrames;
+		if (_saveTopologyPending)
+			return; // already queued; the coroutine will pick up the refreshed delay
+		_saveTopologyPending = true;
+		MelonCoroutines.Start(DeferredSaveTopology());
+	}
+
+	private IEnumerator DeferredSaveTopology()
+	{
+		while (_pendingSaveDelayFrames > 0)
+		{
+			_pendingSaveDelayFrames--;
+			yield return null;
+		}
+		_saveTopologyPending = false;
+		SaveCableTopology();
 	}
 
 	public override void OnUpdate()
 	{
+		Stopwatch overall = Stopwatch.StartNew();
 		if (!_integrated)
+		{
+			Stopwatch integrateWatch = Stopwatch.StartNew();
 			TryIntegrate();
+			integrateWatch.Stop();
+			LogPerformanceEvent("[OnUpdate] TryIntegrate", integrateWatch.ElapsedMilliseconds, $" (frame={Time.frameCount})");
+		}
+		Stopwatch restoreWatch = Stopwatch.StartNew();
 		TryQueueStartupCableRestore();
+		restoreWatch.Stop();
+		LogPerformanceEvent("[OnUpdate] TryQueueStartupCableRestore", restoreWatch.ElapsedMilliseconds, $" (frame={Time.frameCount})");
+		overall.Stop();
+		if (overall.ElapsedMilliseconds >= SlowUpdateThresholdMs || Time.frameCount >= _nextPerformanceHeartbeatFrame)
+		{
+			_nextPerformanceHeartbeatFrame = Time.frameCount + PerformanceHeartbeatIntervalFrames;
+			// Use already-cached snapshot counts — do NOT call GetRackSnapshot/GetCustomerSnapshot here
+			// as that would trigger a new 37ms scene scan on top of the one already done this frame.
+			int rackCount = _cachedRackSnapshot.Count;
+			int customerCount = _cachedCustomerSnapshot.Count;
+			((MelonBase)this).LoggerInstance.Msg($"[Perf][OnUpdate] total={overall.ElapsedMilliseconds}ms integrated={_integrated} restoreQueued={_startupCableRestoreQueued} detailPage={_onDetailPage} selectedRack={((UnityEngine.Object)(object)_selectedRack != (UnityEngine.Object)null)} racks={rackCount} customers={customerCount} frame={Time.frameCount}");
+		}
 	}
 
 	private void TryQueueStartupCableRestore()
 	{
 		if (_startupCableRestoreQueued)
 			return;
-		CablePositions cablePositions = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		int frame = Time.frameCount;
+		if (frame < _nextStartupRestoreCheckFrame)
+			return;
+		_nextStartupRestoreCheckFrame = frame + StartupRestoreCheckIntervalFrames;
+		CablePositions cablePositions = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)cablePositions == (UnityEngine.Object)null)
 			return;
 		int rackCount = 0;
-		foreach (Rack rack in UnityEngine.Object.FindObjectsOfType<Rack>())
+		foreach (Rack rack in GetRackSnapshot())
 		{
 			if ((UnityEngine.Object)(object)rack != (UnityEngine.Object)null)
 				rackCount++;
 		}
 		if (rackCount == 0)
 			return;
-		if (!ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount))
+
+		if (frame < _nextStartupTopologyCheckFrame)
 			return;
+		_nextStartupTopologyCheckFrame = frame + StartupTopologyCheckIntervalFrames;
+
+		if (!ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount))
+		{
+			// Racks are loaded but topology is fine — no restore needed. Stop all future polling.
+			_startupCableRestoreQueued = true;
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Startup topology check complete: live={liveCableCount} expected={expectedCableCount} — no restore needed, polling stopped.");
+			return;
+		}
 		_startupCableRestoreQueued = true;
 		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Startup cable restore queued (live={liveCableCount}, expected={expectedCableCount})");
 		MelonCoroutines.Start(RestoreCablesDeferred(10));
@@ -293,7 +415,7 @@ public class RackBuilderCore : MelonMod
 	{
 		// Build current set of Rack instance IDs in the scene
 		HashSet<int> currentIds = new HashSet<int>();
-		foreach (Rack r in UnityEngine.Object.FindObjectsOfType<Rack>())
+		foreach (Rack r in GetRackSnapshot())
 		{
 			if ((UnityEngine.Object)(object)r != (UnityEngine.Object)null)
 				currentIds.Add(((UnityEngine.Object)(object)r).GetInstanceID());
@@ -337,6 +459,7 @@ public class RackBuilderCore : MelonMod
 
 	private IEnumerator RestoreCablesDeferred(int frames)
 	{
+		Stopwatch watch = Stopwatch.StartNew();
 		for (int i = 0; i < frames; i++)
 			yield return null;
 		((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Restore-only cable pass starting…");
@@ -344,7 +467,152 @@ public class RackBuilderCore : MelonMod
 		RestoreCableTopologyFromFile();
 		ClearEmptySfpPortSpeeds();
 		SaveCableTopology();
-		((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Restore-only cable pass complete");
+		watch.Stop();
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Restore-only cable pass complete in {watch.ElapsedMilliseconds}ms");
+	}
+
+	private CablePositions GetCablePositionsCached()
+	{
+		if ((UnityEngine.Object)(object)_cachedCablePositions != (UnityEngine.Object)null)
+			return _cachedCablePositions;
+		Stopwatch watch = Stopwatch.StartNew();
+		_cachedCablePositions = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		watch.Stop();
+		LogPerformanceEvent("[CablePositions] cache miss lookup", watch.ElapsedMilliseconds, $" (found={((UnityEngine.Object)(object)_cachedCablePositions != (UnityEngine.Object)null)})");
+		return _cachedCablePositions;
+	}
+
+	private List<Rack> GetRackSnapshot()
+	{
+		float now = Time.time;
+		if (now - _cachedRackSnapshotTime < SnapshotCacheTtlSeconds && _cachedRackSnapshot.Count > 0)
+			return _cachedRackSnapshot;
+		Stopwatch watch = Stopwatch.StartNew();
+		_cachedRackSnapshotTime = now;
+		_cachedRackSnapshot.Clear();
+		foreach (Rack rack in UnityEngine.Object.FindObjectsOfType<Rack>())
+		{
+			if ((UnityEngine.Object)(object)rack != (UnityEngine.Object)null)
+				_cachedRackSnapshot.Add(rack);
+		}
+		watch.Stop();
+		LogPerformanceEvent("[GetRackSnapshot] scene scan", watch.ElapsedMilliseconds, $" (racks={_cachedRackSnapshot.Count})");
+		return _cachedRackSnapshot;
+	}
+
+	private void InvalidateRackSnapshot() { _cachedRackSnapshotTime = -999f; }
+
+	private List<CustomerBase> GetCustomerSnapshot()
+	{
+		float now = Time.time;
+		if (now - _cachedCustomerSnapshotTime < SnapshotCacheTtlSeconds && _cachedCustomerSnapshot.Count > 0)
+			return _cachedCustomerSnapshot;
+		Stopwatch watch = Stopwatch.StartNew();
+		_cachedCustomerSnapshotTime = now;
+		_cachedCustomerSnapshot.Clear();
+		foreach (CustomerBase customerBase in UnityEngine.Object.FindObjectsOfType<CustomerBase>())
+		{
+			if ((UnityEngine.Object)(object)customerBase != (UnityEngine.Object)null)
+				_cachedCustomerSnapshot.Add(customerBase);
+		}
+		watch.Stop();
+		LogPerformanceEvent("[GetCustomerSnapshot] scene scan", watch.ElapsedMilliseconds, $" (customers={_cachedCustomerSnapshot.Count})");
+		return _cachedCustomerSnapshot;
+	}
+
+	private List<Server> GetServerSnapshot()
+	{
+		float now = Time.time;
+		if (now - _cachedServersTime < SnapshotCacheTtlSeconds && _cachedServers.Count > 0)
+			return _cachedServers;
+		Stopwatch watch = Stopwatch.StartNew();
+		_cachedServersTime = now;
+		_cachedServers.Clear();
+		foreach (Server s in UnityEngine.Object.FindObjectsOfType<Server>())
+			if ((UnityEngine.Object)(object)s != (UnityEngine.Object)null)
+				_cachedServers.Add(s);
+		watch.Stop();
+		LogPerformanceEvent("[GetServerSnapshot] scene scan", watch.ElapsedMilliseconds, $" (servers={_cachedServers.Count})");
+		return _cachedServers;
+	}
+
+	private List<NetworkSwitch> GetNetworkSwitchSnapshot()
+	{
+		float now = Time.time;
+		if (now - _cachedNetworkSwitchesTime < SnapshotCacheTtlSeconds && _cachedNetworkSwitches.Count > 0)
+			return _cachedNetworkSwitches;
+		Stopwatch watch = Stopwatch.StartNew();
+		_cachedNetworkSwitchesTime = now;
+		_cachedNetworkSwitches.Clear();
+		foreach (NetworkSwitch sw in UnityEngine.Object.FindObjectsOfType<NetworkSwitch>())
+			if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null)
+				_cachedNetworkSwitches.Add(sw);
+		watch.Stop();
+		LogPerformanceEvent("[GetNetworkSwitchSnapshot] scene scan", watch.ElapsedMilliseconds, $" (switches={_cachedNetworkSwitches.Count})");
+		return _cachedNetworkSwitches;
+	}
+
+	private List<PatchPanel> GetPatchPanelSnapshot()
+	{
+		float now = Time.time;
+		if (now - _cachedPatchPanelsTime < SnapshotCacheTtlSeconds && _cachedPatchPanels.Count > 0)
+			return _cachedPatchPanels;
+		Stopwatch watch = Stopwatch.StartNew();
+		_cachedPatchPanelsTime = now;
+		_cachedPatchPanels.Clear();
+		foreach (PatchPanel p in UnityEngine.Object.FindObjectsOfType<PatchPanel>())
+			if ((UnityEngine.Object)(object)p != (UnityEngine.Object)null)
+				_cachedPatchPanels.Add(p);
+		watch.Stop();
+		LogPerformanceEvent("[GetPatchPanelSnapshot] scene scan", watch.ElapsedMilliseconds, $" (panels={_cachedPatchPanels.Count})");
+		return _cachedPatchPanels;
+	}
+
+	private List<Wall> GetWallSnapshot()
+	{
+		float now = Time.time;
+		if (now - _cachedWallsTime < StaticObjectCacheTtlSeconds && _cachedWalls.Count > 0)
+			return _cachedWalls;
+		_cachedWallsTime = now;
+		_cachedWalls.Clear();
+		foreach (Wall w in UnityEngine.Object.FindObjectsOfType<Wall>())
+			if ((UnityEngine.Object)(object)w != (UnityEngine.Object)null)
+				_cachedWalls.Add(w);
+		return _cachedWalls;
+	}
+
+	private List<RackMount> GetMountSnapshot()
+	{
+		float now = Time.time;
+		if (now - _cachedMountsTime < StaticObjectCacheTtlSeconds && _cachedMounts.Count > 0)
+			return _cachedMounts;
+		_cachedMountsTime = now;
+		_cachedMounts.Clear();
+		foreach (RackMount m in UnityEngine.Object.FindObjectsOfType<RackMount>())
+			if ((UnityEngine.Object)(object)m != (UnityEngine.Object)null)
+				_cachedMounts.Add(m);
+		return _cachedMounts;
+	}
+
+	private MainGameManager GetMainGameManager()
+	{
+		if ((UnityEngine.Object)(object)_cachedGameManager != (UnityEngine.Object)null)
+			return _cachedGameManager;
+		_cachedGameManager = UnityEngine.Object.FindObjectOfType<MainGameManager>();
+		return _cachedGameManager;
+	}
+
+	private List<UsableObject> GetUsableObjectSnapshot()
+	{
+		float now = Time.time;
+		if (now - _cachedUsableObjectsTime < SnapshotCacheTtlSeconds && _cachedUsableObjects.Count > 0)
+			return _cachedUsableObjects;
+		_cachedUsableObjectsTime = now;
+		_cachedUsableObjects.Clear();
+		foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
+			if ((UnityEngine.Object)(object)uo != (UnityEngine.Object)null)
+				_cachedUsableObjects.Add(uo);
+		return _cachedUsableObjects;
 	}
 
 	private IEnumerator EnableCollidersDelayed(GameObject go)
@@ -398,6 +666,7 @@ public class RackBuilderCore : MelonMod
 	/// </summary>
 	private IEnumerator AutoWireAllRacksDeferred(int frames)
 	{
+		Stopwatch watch = Stopwatch.StartNew();
 		for (int i = 0; i < frames; i++) yield return null;
 		((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Post-reload auto-wire starting…");
 		// Clear stale cableIDsOnLink values that the game saved from a prior session but whose
@@ -411,7 +680,7 @@ public class RackBuilderCore : MelonMod
 		_suppressUiUpdates = true;
 		try
 		{
-			foreach (Rack r in UnityEngine.Object.FindObjectsOfType<Rack>())
+			foreach (Rack r in GetRackSnapshot())
 			{
 				if ((UnityEngine.Object)(object)r == (UnityEngine.Object)null) continue;
 				_selectedRack = r;
@@ -427,6 +696,8 @@ public class RackBuilderCore : MelonMod
 		ClearEmptySfpPortSpeeds();
 		// Persist cable topology so it survives next save/reload cycle.
 		SaveCableTopology();
+		watch.Stop();
+		((MelonBase)this).LoggerInstance.Msg($"[Perf][AutoWireAllRacksDeferred] frames={frames} wired={wiredCount} in {watch.ElapsedMilliseconds}ms");
 	}
 
 	private static bool IsPlacedRackObject(Component component)
@@ -490,9 +761,10 @@ public class RackBuilderCore : MelonMod
 		return null;
 	}
 
-	private static string BuildCurrentTopologyFingerprint()
+	private static bool TryBuildLiveTopologySnapshot(out string fingerprint, out int liveCableCount)
 	{
 		List<string> parts = new List<string>();
+		liveCableCount = 0;
 		foreach (Server server in UnityEngine.Object.FindObjectsOfType<Server>())
 		{
 			if ((UnityEngine.Object)(object)server == (UnityEngine.Object)null || server.cablelinks == null || !IsPlacedRackObject((Component)(object)server))
@@ -501,6 +773,11 @@ public class RackBuilderCore : MelonMod
 			if (rackPositionUid <= 0)
 				continue;
 			parts.Add($"S:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)server.cablelinks).Length}");
+			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)server.cablelinks)
+			{
+				if ((UnityEngine.Object)(object)port != (UnityEngine.Object)null && port.cableIDsOnLink > 0)
+					liveCableCount++;
+			}
 		}
 		foreach (NetworkSwitch networkSwitch in UnityEngine.Object.FindObjectsOfType<NetworkSwitch>())
 		{
@@ -521,23 +798,20 @@ public class RackBuilderCore : MelonMod
 			parts.Add($"P:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)patchPanel.cableLinkPorts).Length}");
 		}
 		parts.Sort(StringComparer.Ordinal);
-		return string.Join("|", parts);
+		fingerprint = string.Join("|", parts);
+		return true;
+	}
+
+	private static string BuildCurrentTopologyFingerprint()
+	{
+		TryBuildLiveTopologySnapshot(out string fingerprint, out _);
+		return fingerprint;
 	}
 
 	private static int CountLiveServerPortsWithPersistentCables()
 	{
-		int count = 0;
-		foreach (Server server in UnityEngine.Object.FindObjectsOfType<Server>())
-		{
-			if ((UnityEngine.Object)(object)server == (UnityEngine.Object)null || server.cablelinks == null || !IsPlacedRackObject((Component)(object)server))
-				continue;
-			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)server.cablelinks)
-			{
-				if ((UnityEngine.Object)(object)port != (UnityEngine.Object)null && port.cableIDsOnLink > 0)
-					count++;
-			}
-		}
-		return count;
+		TryBuildLiveTopologySnapshot(out _, out int liveCableCount);
+		return liveCableCount;
 	}
 
 	private bool ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount)
@@ -553,11 +827,11 @@ public class RackBuilderCore : MelonMod
 			CableTopologyData topology = JsonSerializer.Deserialize<CableTopologyData>(json);
 			if (topology == null || topology.Cables == null || topology.Cables.Count == 0)
 				return false;
-			string currentFingerprint = BuildCurrentTopologyFingerprint();
+			if (!TryBuildLiveTopologySnapshot(out string currentFingerprint, out liveCableCount))
+				return false;
 			if (!string.IsNullOrEmpty(topology.LayoutFingerprint) && !string.Equals(topology.LayoutFingerprint, currentFingerprint, StringComparison.Ordinal))
 				return false;
 			expectedCableCount = topology.Cables.Count;
-			liveCableCount = CountLiveServerPortsWithPersistentCables();
 			return liveCableCount < expectedCableCount;
 		}
 		catch (Exception ex)
@@ -698,11 +972,11 @@ public class RackBuilderCore : MelonMod
 	{
 		if ((UnityEngine.Object)(object)sourceRack == (UnityEngine.Object)null)
 			return 0;
-		CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		CablePositions cp = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null)
 			return 0;
 		CustomerBase targetBase = null;
-		foreach (CustomerBase candidate in UnityEngine.Object.FindObjectsOfType<CustomerBase>())
+		foreach (CustomerBase candidate in GetCustomerSnapshot())
 		{
 			if ((UnityEngine.Object)(object)candidate != (UnityEngine.Object)null && candidate.customerBaseID == targetBaseId)
 			{
@@ -769,7 +1043,7 @@ public class RackBuilderCore : MelonMod
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
 			return;
 		Rack serverRack = _selectedRack;
-		List<Rack> networkRacks = UnityEngine.Object.FindObjectsOfType<Rack>()
+		List<Rack> networkRacks = GetRackSnapshot()
 			.Where((Rack r) => (UnityEngine.Object)(object)r != (UnityEngine.Object)null && (UnityEngine.Object)(object)r != (UnityEngine.Object)(object)serverRack && GetRackRole(r) == RackRoleNetwork)
 			.ToList();
 		if (networkRacks.Count == 0)
@@ -779,7 +1053,7 @@ public class RackBuilderCore : MelonMod
 			return;
 		}
 
-		CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		CablePositions cp = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null)
 			return;
 
@@ -840,7 +1114,7 @@ public class RackBuilderCore : MelonMod
 
 		int customerCount = WireRackSwitchesToCustomer(targetNetworkRack, targetBaseId);
 		((MelonBase)this).LoggerInstance.Msg($"Server->Network->Customer complete: trunks={trunkCount}, customerLinks={customerCount}");
-		SaveCableTopology();
+		QueueSaveTopology();
 		ShowRackDetail();
 	}
 
@@ -851,14 +1125,16 @@ public class RackBuilderCore : MelonMod
 	/// </summary>
 	private void SaveCableTopology()
 	{
+		Stopwatch watch = Stopwatch.StartNew();
 		try
 		{
 			var topology = new CableTopologyData();
 			topology.LayoutFingerprint = BuildCurrentTopologyFingerprint();
 			HashSet<string> seen = new HashSet<string>();
-			var servers = UnityEngine.Object.FindObjectsOfType<Server>().Where((Server s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.ServerID) && s.ServerID.StartsWith("Mod_")).ToList();
-			var switches = UnityEngine.Object.FindObjectsOfType<NetworkSwitch>().Where((NetworkSwitch s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.switchId) && s.switchId.StartsWith("Mod_")).ToList();
-			var panels = UnityEngine.Object.FindObjectsOfType<PatchPanel>().Where((PatchPanel p) => (UnityEngine.Object)(object)p != (UnityEngine.Object)null && p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p) && !string.IsNullOrEmpty(p.patchPanelId) && p.patchPanelId.StartsWith("Mod_")).ToList();
+			// Use time-cached snapshots — avoids 235ms FindObjectsOfType on every save trigger.
+			var servers = GetServerSnapshot().Where((Server s) => s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.ServerID) && s.ServerID.StartsWith("Mod_")).ToList();
+			var switches = GetNetworkSwitchSnapshot().Where((NetworkSwitch s) => s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.switchId) && s.switchId.StartsWith("Mod_")).ToList();
+			var panels = GetPatchPanelSnapshot().Where((PatchPanel p) => p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p) && !string.IsNullOrEmpty(p.patchPanelId) && p.patchPanelId.StartsWith("Mod_")).ToList();
 
 			Dictionary<int, CableLink> switchPortByCableId = new Dictionary<int, CableLink>();
 			foreach (NetworkSwitch sw in switches)
@@ -955,9 +1231,15 @@ public class RackBuilderCore : MelonMod
 				}
 			}
 			string filePath = Path.Combine(UnityEngine.Application.persistentDataPath, "RackCables.json");
-			string json = JsonSerializer.Serialize(topology, new JsonSerializerOptions { WriteIndented = true });
-			File.WriteAllText(filePath, json);
-			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Saved {topology.Cables.Count} cables to RackCables.json (servers={servers.Count}, switches={switches.Count}, patchPanels={panels.Count})");
+			watch.Stop();
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Topology built in {watch.ElapsedMilliseconds}ms ({topology.Cables.Count} cables, servers={servers.Count}, switches={switches.Count}, patchPanels={panels.Count}) — writing async");
+			// Hand serialize + disk write off the main thread — topology is pure C# by this point.
+			var topologyCapture = topology;
+			System.Threading.Tasks.Task.Run(() =>
+			{
+				string json = JsonSerializer.Serialize(topologyCapture, new JsonSerializerOptions { WriteIndented = true });
+				File.WriteAllText(filePath, json);
+			});
 		}
 		catch (Exception ex)
 		{
@@ -971,15 +1253,31 @@ public class RackBuilderCore : MelonMod
 	/// </summary>
 	private void RestoreCableTopologyFromFile()
 	{
+		Stopwatch watch = Stopwatch.StartNew();
 		try
 		{
 			string filePath = Path.Combine(UnityEngine.Application.persistentDataPath, "RackCables.json");
-			if (!File.Exists(filePath)) return;
+			if (!File.Exists(filePath))
+			{
+				watch.Stop();
+				((MelonBase)this).LoggerInstance.Msg($"[RackBuilder][Restore] RackCables.json not found after {watch.ElapsedMilliseconds}ms");
+				return;
+			}
 			string json = File.ReadAllText(filePath);
 			var topology = JsonSerializer.Deserialize<CableTopologyData>(json);
-			if (topology?.Cables.Count == 0) return;
-			CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
-			if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null) return;
+			if (topology?.Cables.Count == 0)
+			{
+				watch.Stop();
+				((MelonBase)this).LoggerInstance.Msg($"[RackBuilder][Restore] RackCables.json had no cables after {watch.ElapsedMilliseconds}ms");
+				return;
+			}
+			CablePositions cp = GetCablePositionsCached();
+			if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null)
+			{
+				watch.Stop();
+				((MelonBase)this).LoggerInstance.Msg($"[RackBuilder][Restore] CablePositions missing after {watch.ElapsedMilliseconds}ms");
+				return;
+			}
 			var serversById = UnityEngine.Object.FindObjectsOfType<Server>()
 				.Where((Server s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.ServerID) && s.ServerID.StartsWith("Mod_"))
 				.GroupBy((Server s) => s.ServerID)
@@ -1104,7 +1402,15 @@ public class RackBuilderCore : MelonMod
 				}
 			}
 			if (restored > 0)
-				((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Restored {restored} cables from RackCables.json" + ((restoredByRackPositionFallback > 0) ? $" ({restoredByRackPositionFallback} via rack-position fallback)" : ""));
+			{
+				watch.Stop();
+				((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Restored {restored} cables from RackCables.json in {watch.ElapsedMilliseconds}ms" + ((restoredByRackPositionFallback > 0) ? $" ({restoredByRackPositionFallback} via rack-position fallback)" : ""));
+			}
+			else
+			{
+				watch.Stop();
+				((MelonBase)this).LoggerInstance.Msg($"[RackBuilder][Restore] Completed in {watch.ElapsedMilliseconds}ms with no new cables restored");
+			}
 		}
 		catch (Exception ex)
 		{
@@ -1122,7 +1428,7 @@ public class RackBuilderCore : MelonMod
 	/// </summary>
 	private void ClearOrphanedCableIds()
 	{
-		CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		CablePositions cp = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null) return;
 		int cleared = 0;
 		foreach (CableLink cl in UnityEngine.Object.FindObjectsOfType<CableLink>())
@@ -1178,14 +1484,14 @@ public class RackBuilderCore : MelonMod
 	{
 		if (_disableAutoWireForDebug) return;
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null) return;
-		CablePositions cp = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		CablePositions cp = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null) return;
 		AutoWireRack(); // reuses all the existing cable-creation logic; skips already-wired ports
 	}
 
 	private IEnumerator ScrubPlacedDeviceCableIds(GameObject go, int frames)
 	{
-		CablePositions cablePositions = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		CablePositions cablePositions = GetCablePositionsCached();
 		for (int i = 0; i < frames; i++)
 		{
 			yield return null;
@@ -1362,9 +1668,8 @@ public class RackBuilderCore : MelonMod
 
 	private void OpenAllWalls()
 	{
-		Il2CppArrayBase<Wall> val = UnityEngine.Object.FindObjectsOfType<Wall>();
 		int num = 0;
-		foreach (Wall item in val)
+		foreach (Wall item in GetWallSnapshot())
 		{
 			if (!((UnityEngine.Object)(object)item == (UnityEngine.Object)null) && !item.isWallOpened)
 			{
@@ -1517,6 +1822,7 @@ public class RackBuilderCore : MelonMod
 	private void ShowRackList()
 	{
 		if (_suppressUiUpdates) return;
+		Stopwatch watch = Stopwatch.StartNew();
 		//IL_01bf: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0340: Unknown result type (might be due to invalid IL or missing references)
 		//IL_03a2: Unknown result type (might be due to invalid IL or missing references)
@@ -1541,8 +1847,7 @@ public class RackBuilderCore : MelonMod
 		ClearContent();
 		_pendingBulkClearConfirmation = false;
 		_allRacks.Clear();
-		Il2CppArrayBase<Rack> val = UnityEngine.Object.FindObjectsOfType<Rack>();
-		foreach (Rack item in val)
+		foreach (Rack item in GetRackSnapshot())
 		{
 			if ((UnityEngine.Object)(object)item != (UnityEngine.Object)null)
 			{
@@ -1552,20 +1857,16 @@ public class RackBuilderCore : MelonMod
 		if ((UnityEngine.Object)(object)_pendingRemoveMount != (UnityEngine.Object)null)
 		{
 			ShowRemoveConfirmation();
+			watch.Stop();
+			((MelonBase)this).LoggerInstance.Msg($"[Perf][ShowRackList] remove confirmation in {watch.ElapsedMilliseconds}ms");
 			return;
 		}
 		AddTitle("Data Center Floor Plan");
-		Il2CppArrayBase<Wall> val2 = UnityEngine.Object.FindObjectsOfType<Wall>();
 		int num = 0;
-		if (val2 != null)
+		foreach (Wall item2 in GetWallSnapshot())
 		{
-			foreach (Wall item2 in val2)
-			{
-				if ((UnityEngine.Object)(object)item2 != (UnityEngine.Object)null && !item2.isWallOpened)
-				{
-					num++;
-				}
-			}
+			if ((UnityEngine.Object)(object)item2 != (UnityEngine.Object)null && !item2.isWallOpened)
+				num++;
 		}
 		if (num > 0)
 		{
@@ -1574,19 +1875,13 @@ public class RackBuilderCore : MelonMod
 				OpenAllWalls();
 			});
 		}
-		Il2CppArrayBase<RackMount> val3 = UnityEngine.Object.FindObjectsOfType<RackMount>();
-		if (val3 == null || val3.Length == 0)
+		List<RackMount> list = GetMountSnapshot();
+		if (list.Count == 0)
 		{
 			AddLabel("No mounts.");
+			watch.Stop();
+			((MelonBase)this).LoggerInstance.Msg($"[Perf][ShowRackList] no mounts in {watch.ElapsedMilliseconds}ms");
 			return;
-		}
-		List<RackMount> list = new List<RackMount>();
-		foreach (RackMount item3 in val3)
-		{
-			if ((UnityEngine.Object)(object)item3 != (UnityEngine.Object)null)
-			{
-				list.Add(item3);
-			}
 		}
 		SortedSet<int> sortedSet = new SortedSet<int>();
 		foreach (RackMount item4 in list)
@@ -1736,6 +2031,8 @@ public class RackBuilderCore : MelonMod
 				((Selectable)val11).colors = colors;
 			}
 		}
+		watch.Stop();
+		((MelonBase)this).LoggerInstance.Msg($"[Perf][ShowRackList] racks={_allRacks.Count} mounts={list.Count} columns={list2.Count} rows={list4.Count} in {watch.ElapsedMilliseconds}ms");
 	}
 
 	private string GetRackUtilizationText(Rack rack)
@@ -1817,7 +2114,7 @@ public class RackBuilderCore : MelonMod
 			mount.isRackInstantiated = false;
 			return;
 		}
-		CablePositions val = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		CablePositions val = GetCablePositionsCached();
 		int num = 0;
 		foreach (CableLink componentsInChild in ((Component)componentInChildren).GetComponentsInChildren<CableLink>(true))
 		{
@@ -1912,7 +2209,7 @@ public class RackBuilderCore : MelonMod
 		if (badIds.Count == 0)
 			return;
 
-		CablePositions cablePositions = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		CablePositions cablePositions = GetCablePositionsCached();
 		int cleared = 0;
 		foreach (int id in badIds)
 		{
@@ -1955,7 +2252,7 @@ public class RackBuilderCore : MelonMod
 		}
 
 		HashSet<int> seen = new HashSet<int>();
-		foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
+		foreach (UsableObject uo in GetUsableObjectSnapshot())
 		{
 			if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
 			bool inRack = false;
@@ -2197,6 +2494,7 @@ public class RackBuilderCore : MelonMod
 	private void ShowRackDetail()
 	{
 		if (_suppressUiUpdates) return;
+		Stopwatch watch = Stopwatch.StartNew();
 		//IL_139a: Unknown result type (might be due to invalid IL or missing references)
 		//IL_01eb: Unknown result type (might be due to invalid IL or missing references)
 		//IL_01e4: Unknown result type (might be due to invalid IL or missing references)
@@ -2217,6 +2515,8 @@ public class RackBuilderCore : MelonMod
 		ClearContent();
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
 		{
+			watch.Stop();
+			((MelonBase)this).LoggerInstance.Msg($"[Perf][ShowRackDetail] no selected rack in {watch.ElapsedMilliseconds}ms");
 			return;
 		}
 		// Intentionally do not run global ghost-cable sanitation here.
@@ -2380,7 +2680,7 @@ public class RackBuilderCore : MelonMod
 		// Uses currentRackPosition object-reference ? immune to UID integer collisions across racks.
 		if (slotsFound.Count < num)
 		{
-			foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
+			foreach (UsableObject uo in GetUsableObjectSnapshot())
 			{
 				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
 				if ((UnityEngine.Object)(object)uo.currentRackPosition == (UnityEngine.Object)null) continue;
@@ -2566,9 +2866,7 @@ public class RackBuilderCore : MelonMod
 				num15++;
 		}
 		int num17 = 0;
-		Il2CppArrayBase<CustomerBase> val6 = UnityEngine.Object.FindObjectsOfType<CustomerBase>();
-
-		foreach (CustomerBase item13 in val6)
+		foreach (CustomerBase item13 in GetCustomerSnapshot())
 		{
 			if ((UnityEngine.Object)(object)item13 == (UnityEngine.Object)null)
 				continue;
@@ -2581,6 +2879,8 @@ public class RackBuilderCore : MelonMod
 		}
 		if (num15 <= 0)
 		{
+			watch.Stop();
+			((MelonBase)this).LoggerInstance.Msg($"[Perf][ShowRackDetail] no uplinkable switch ports in {watch.ElapsedMilliseconds}ms");
 			return;
 		}
 		AddSpacer();
@@ -2589,7 +2889,7 @@ public class RackBuilderCore : MelonMod
 		else
 			AddColorLabel($"  Connect Server Rack via Network Rack to Customer: ({num15} source switches)", Color.white);
 		bool flag4 = false;
-		foreach (CustomerBase item15 in val6)
+		foreach (CustomerBase item15 in GetCustomerSnapshot())
 		{
 			if ((UnityEngine.Object)(object)item15 == (UnityEngine.Object)null || item15.cableLinks == null || item15.customerID < 0)
 			{
@@ -2612,7 +2912,7 @@ public class RackBuilderCore : MelonMod
 			string value3 = $"Customer {customerID}";
 			try
 			{
-				MainGameManager val8 = UnityEngine.Object.FindObjectOfType<MainGameManager>();
+				MainGameManager val8 = GetMainGameManager();
 				if ((UnityEngine.Object)(object)val8 != (UnityEngine.Object)null)
 				{
 					CustomerItem customerItemByID = val8.GetCustomerItemByID(customerID);
@@ -2645,6 +2945,8 @@ public class RackBuilderCore : MelonMod
 		{
 			AddColorLabel("    No active customers with free ports", new Color(0.5f, 0.3f, 0.3f));
 		}
+		watch.Stop();
+		((MelonBase)this).LoggerInstance.Msg($"[Perf][ShowRackDetail] selectedRack={((UnityEngine.Object)(object)_selectedRack != (UnityEngine.Object)null)} used={num2} cart={num3} installed={list.Count} switches={rackSwitches.Count} customers={num17} in {watch.ElapsedMilliseconds}ms");
 	}
 
 	private List<(int sfpType, float speed, int prefabIdx, string name)> BuildSfpPrefabList(MainGameManager mgr)
@@ -2854,7 +3156,7 @@ public class RackBuilderCore : MelonMod
 		{
 			return;
 		}
-		MainGameManager val = UnityEngine.Object.FindObjectOfType<MainGameManager>();
+		MainGameManager val = GetMainGameManager();
 		if ((UnityEngine.Object)(object)val == (UnityEngine.Object)null || val.sfpPrefabs == null)
 		{
 			((MelonBase)this).LoggerInstance.Error("SFP prefabs unavailable");
@@ -2941,17 +3243,22 @@ public class RackBuilderCore : MelonMod
 
 	private void AutoWireRack()
 	{
+		Stopwatch watch = Stopwatch.StartNew();
 		if (_disableAutoWireForDebug)
 		{
 			((MelonBase)this).LoggerInstance.Msg("AutoWireRack is disabled by debug flag");
+			watch.Stop();
+			LogPerformanceEvent("[AutoWireRack] skipped by debug flag", watch.ElapsedMilliseconds, $" (frame={Time.frameCount})", 0L);
 			return;
 		}
 
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
 		{
+			watch.Stop();
+			LogPerformanceEvent("[AutoWireRack] skipped: no selected rack", watch.ElapsedMilliseconds, $" (frame={Time.frameCount})", 0L);
 			return;
 		}
-		CablePositions val = UnityEngine.Object.FindObjectOfType<CablePositions>();
+		CablePositions val = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)val == (UnityEngine.Object)null)
 		{
 			((MelonBase)this).LoggerInstance.Error("CablePositions not found");
@@ -3246,7 +3553,9 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 		((MelonBase)this).LoggerInstance.Msg($"Auto-wire complete: {num} connections made");
-		SaveCableTopology();
+		watch.Stop();
+		((MelonBase)this).LoggerInstance.Msg($"[Perf][AutoWireRack] servers={rackServers.Count} switches={rackSwitches.Count} patchPanels={rackPatchPanels.Count} connections={num} in {watch.ElapsedMilliseconds}ms");
+		QueueSaveTopology();
 		ShowRackDetail();
 		static bool PortsCompatible(CableLink s, CableLink sw)
 		{
@@ -3528,18 +3837,25 @@ public class RackBuilderCore : MelonMod
 
 	private void AutoWireToCustomer(int targetBaseId)
 	{
+		Stopwatch watch = Stopwatch.StartNew();
 		if (_disableAutoWireForDebug)
 		{
 			((MelonBase)this).LoggerInstance.Msg($"AutoWireToCustomer is disabled by debug flag (target {targetBaseId})");
+			watch.Stop();
+			LogPerformanceEvent("[AutoWireToCustomer] skipped by debug flag", watch.ElapsedMilliseconds, $" (targetBaseId={targetBaseId})", 0L);
 			return;
 		}
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
 		{
+			watch.Stop();
+			LogPerformanceEvent("[AutoWireToCustomer] skipped: no selected rack", watch.ElapsedMilliseconds, $" (targetBaseId={targetBaseId})", 0L);
 			return;
 		}
 		int num = WireRackSwitchesToCustomer(_selectedRack, targetBaseId);
 		((MelonBase)this).LoggerInstance.Msg($"AutoWireToCustomer complete: {num} cables");
-		SaveCableTopology();
+		watch.Stop();
+		((MelonBase)this).LoggerInstance.Msg($"[Perf][AutoWireToCustomer] targetBaseId={targetBaseId} cables={num} in {watch.ElapsedMilliseconds}ms");
+		QueueSaveTopology();
 		ShowRackDetail();
 	}
 
@@ -3638,7 +3954,7 @@ public class RackBuilderCore : MelonMod
 		{
 			return;
 		}
-		MainGameManager val = UnityEngine.Object.FindObjectOfType<MainGameManager>();
+		MainGameManager val = GetMainGameManager();
 		if ((UnityEngine.Object)(object)val == (UnityEngine.Object)null)
 		{
 			return;
@@ -4020,6 +4336,8 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 		((MelonBase)this).LoggerInstance.Msg($"Installed {num2}/{list.Count} items");
+		// New objects were spawned — invalidate UsableObject cache so ShowRackDetail sees them.
+		_cachedUsableObjectsTime = -999f;
 		_cartQty.Clear();
 		ShowRackDetail();
 	}
@@ -4045,7 +4363,7 @@ public class RackBuilderCore : MelonMod
 			}
 			mount.isRackInstantiated = true;
 			Rack val3 = val2.GetComponent<Rack>() ?? val2.GetComponentInChildren<Rack>();
-			MainGameManager val4 = UnityEngine.Object.FindObjectOfType<MainGameManager>();
+			MainGameManager val4 = GetMainGameManager();
 			if ((UnityEngine.Object)(object)val3 != (UnityEngine.Object)null && val3.positions != null && (UnityEngine.Object)(object)val4 != (UnityEngine.Object)null)
 			{
 				int num = 0;
@@ -4271,7 +4589,7 @@ public class RackBuilderCore : MelonMod
 		// find it by currentRackPosition object-reference ? immune to UID integer collisions across racks.
 		if ((UnityEngine.Object)(object)val2 == (UnityEngine.Object)null && val.rackPosGlobalUID != 0)
 		{
-			foreach (UsableObject uo in UnityEngine.Object.FindObjectsOfType<UsableObject>())
+			foreach (UsableObject uo in GetUsableObjectSnapshot())
 			{
 				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
 				if ((UnityEngine.Object)(object)uo.currentRackPosition != (UnityEngine.Object)(object)val) continue;
@@ -4304,7 +4622,7 @@ public class RackBuilderCore : MelonMod
 		}
 		try
 		{
-			CablePositions val3 = UnityEngine.Object.FindObjectOfType<CablePositions>();
+			CablePositions val3 = GetCablePositionsCached();
 			Server component = ((Component)val2).GetComponent<Server>();
 			NetworkSwitch component2 = ((Component)val2).GetComponent<NetworkSwitch>();
 			CableLink[] array = null;
@@ -4373,7 +4691,9 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 		UnityEngine.Object.Destroy((UnityEngine.Object)(object)((Component)val2).gameObject);
-		((MelonBase)this).LoggerInstance.Msg($"Removed {((UnityEngine.Object)((Component)val2).gameObject).name} ? anchor U{anchorIdx + 1}, range U{num + 1}?U{num + size} ({size}U)");
+		// Item destroyed — invalidate UsableObject cache so next ShowRackDetail reflects the change.
+		_cachedUsableObjectsTime = -999f;
+		((MelonBase)this).LoggerInstance.Msg($"Removed {((UnityEngine.Object)((Component)val2).gameObject).name} — anchor U{anchorIdx + 1}, range U{num + 1}–U{num + size} ({size}U)");
 	}
 
 	private int RemoveAllItemsFromSelectedRack()
@@ -4532,7 +4852,7 @@ public class RackBuilderCore : MelonMod
 	private void BuildItemChoices()
 	{
 		_itemChoices.Clear();
-		MainGameManager val = UnityEngine.Object.FindObjectOfType<MainGameManager>();
+		MainGameManager val = GetMainGameManager();
 		if ((UnityEngine.Object)(object)val == (UnityEngine.Object)null)
 		{
 			return;
@@ -4626,7 +4946,7 @@ public class RackBuilderCore : MelonMod
 		{
 			return;
 		}
-		MainGameManager val = UnityEngine.Object.FindObjectOfType<MainGameManager>();
+		MainGameManager val = GetMainGameManager();
 		if ((UnityEngine.Object)(object)val == (UnityEngine.Object)null)
 		{
 			return;
