@@ -262,7 +262,7 @@ public class RackBuilderCore : MelonMod
 
 	public override void OnInitializeMelon()
 	{
-		((MelonBase)this).LoggerInstance.Msg("Rack Builder Mod v1.1.2a initialized!");
+		((MelonBase)this).LoggerInstance.Msg("Rack Builder Mod v1.1.3 initialized!");
 	}
 
 	public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -1038,10 +1038,17 @@ public class RackBuilderCore : MelonMod
 		return wired;
 	}
 
-	private void AutoWireServerRackToCustomerViaNetwork(int targetBaseId)
+	/// <summary>
+	/// Wires ONE uplink port per switch on the selected server rack to the nearest network rack,
+	/// following A/B grouping: server SW index 0 (A) → network SW index 0 (A), etc., cycling
+	/// through network switches if there are more server switches than network switches.
+	/// Returns the target network rack (or null if none found / nothing wired).
+	/// Does NOT connect to any customer — call WireRackSwitchesToCustomer separately if needed.
+	/// </summary>
+	private Rack AutoWireServerToNetworkRack()
 	{
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
-			return;
+			return null;
 		Rack serverRack = _selectedRack;
 		List<Rack> networkRacks = GetRackSnapshot()
 			.Where((Rack r) => (UnityEngine.Object)(object)r != (UnityEngine.Object)null && (UnityEngine.Object)(object)r != (UnityEngine.Object)(object)serverRack && GetRackRole(r) == RackRoleNetwork)
@@ -1049,71 +1056,105 @@ public class RackBuilderCore : MelonMod
 		if (networkRacks.Count == 0)
 		{
 			((MelonBase)this).LoggerInstance.Msg("No network racks defined. Toggle at least one rack to NETWORK role.");
-			ShowRackDetail();
-			return;
+			return null;
 		}
 
 		CablePositions cp = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null)
-			return;
+			return null;
 
 		Rack targetNetworkRack = networkRacks
 			.OrderBy((Rack r) => (((Component)r).transform.position - ((Component)serverRack).transform.position).sqrMagnitude)
 			.First();
 
-		List<CableLink> serverRackSwitchPorts = new List<CableLink>();
-		foreach (NetworkSwitch sw in CollectRackSwitches(serverRack))
-		{
-			if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null || sw.cableLinkSwitchPorts == null)
-				continue;
-			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
-			{
-				if (IsPortReadyForCable(port))
-					serverRackSwitchPorts.Add(port);
-			}
-		}
+		// Sort server rack switches top→bottom (A=0, B=1, ...) by Y position descending.
+		List<NetworkSwitch> serverSwitches = CollectRackSwitches(serverRack)
+			.Where((NetworkSwitch s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null)
+			.OrderByDescending((NetworkSwitch s) => ((Component)s).transform.position.y)
+			.ToList();
 
-		List<CableLink> networkRackSwitchPorts = new List<CableLink>();
-		foreach (NetworkSwitch sw in CollectRackSwitches(targetNetworkRack))
+		// Sort network rack switches top→bottom (A=0, B=1, ...) by Y position descending.
+		List<NetworkSwitch> networkSwitches = CollectRackSwitches(targetNetworkRack)
+			.Where((NetworkSwitch s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null)
+			.OrderByDescending((NetworkSwitch s) => ((Component)s).transform.position.y)
+			.ToList();
+
+		if (networkSwitches.Count == 0)
 		{
-			if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null || sw.cableLinkSwitchPorts == null)
-				continue;
-			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
-			{
-				if (IsPortReadyForCable(port))
-					networkRackSwitchPorts.Add(port);
-			}
+			((MelonBase)this).LoggerInstance.Msg("Target network rack has no switches.");
+			return null;
 		}
 
 		Vector3 from = ((Component)serverRack).transform.position;
 		Vector3 to = ((Component)targetNetworkRack).transform.position;
 		List<Transform> interRackOverhead = BuildOverheadPath(from, to);
 		int trunkCount = 0;
-		foreach (CableLink src in serverRackSwitchPorts)
+
+		// One uplink per server switch, mapped A/B to the network rack switch group.
+		for (int srvIdx = 0; srvIdx < serverSwitches.Count; srvIdx++)
 		{
-			CableLink dst = networkRackSwitchPorts.FirstOrDefault((CableLink p) => IsPortReadyForCable(p) && p.isFibrePort == src.isFibrePort);
-			if ((UnityEngine.Object)(object)dst == (UnityEngine.Object)null)
+			NetworkSwitch srcSwitch = serverSwitches[srvIdx];
+			if (srcSwitch.cableLinkSwitchPorts == null) continue;
+
+			// Pick the first free compatible uplink port on this server switch.
+			CableLink srcPort = null;
+			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)srcSwitch.cableLinkSwitchPorts)
+			{
+				if (IsPortReadyForCable(port)) { srcPort = port; break; }
+			}
+			if ((UnityEngine.Object)(object)srcPort == (UnityEngine.Object)null) continue;
+
+			// Map server switch index → network switch (A→A, B→B, cycling if net rack has more/fewer).
+			int netIdx = srvIdx % networkSwitches.Count;
+			NetworkSwitch dstSwitch = networkSwitches[netIdx];
+			if (dstSwitch.cableLinkSwitchPorts == null) continue;
+
+			// Pick the first free port on the target network switch that matches fibre type.
+			CableLink dstPort = null;
+			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)dstSwitch.cableLinkSwitchPorts)
+			{
+				if (IsPortReadyForCable(port) && port.isFibrePort == srcPort.isFibrePort) { dstPort = port; break; }
+			}
+			if ((UnityEngine.Object)(object)dstPort == (UnityEngine.Object)null)
+			{
+				((MelonBase)this).LoggerInstance.Msg($"  Trunk: no free port on net SW[{netIdx}] for server SW[{srvIdx}] (fibre={srcPort.isFibrePort})");
 				continue;
+			}
+
 			Rack prev = _selectedRack;
 			try
 			{
 				List<Transform> waypoints = new List<Transform>();
 				_selectedRack = serverRack;
-				waypoints.AddRange(BuildRackExitPath(src));
+				waypoints.AddRange(BuildRackExitPath(srcPort));
 				waypoints.AddRange(interRackOverhead);
 				_selectedRack = targetNetworkRack;
-				waypoints.AddRange(BuildRackEnterPath(dst));
-				if (CreateCable(cp, src, dst, waypoints, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.Switch, ""))
+				waypoints.AddRange(BuildRackEnterPath(dstPort));
+				if (CreateCable(cp, srcPort, dstPort, waypoints, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.Switch, ""))
+				{
 					trunkCount++;
+					((MelonBase)this).LoggerInstance.Msg($"  Trunk: server SW[{srvIdx}] → net SW[{netIdx}] (fibre={srcPort.isFibrePort})");
+				}
 			}
 			finally
 			{
 				_selectedRack = prev;
 			}
 		}
+		((MelonBase)this).LoggerInstance.Msg($"Server->NetworkRack trunk wiring: {trunkCount} trunk cables to {((UnityEngine.Object)((Component)targetNetworkRack).gameObject).name}");
+		return targetNetworkRack;
+	}
 
+	private void AutoWireServerRackToCustomerViaNetwork(int targetBaseId)
+	{
+		Rack targetNetworkRack = AutoWireServerToNetworkRack();
+		if ((UnityEngine.Object)(object)targetNetworkRack == (UnityEngine.Object)null)
+		{
+			ShowRackDetail();
+			return;
+		}
 		int customerCount = WireRackSwitchesToCustomer(targetNetworkRack, targetBaseId);
-		((MelonBase)this).LoggerInstance.Msg($"Server->Network->Customer complete: trunks={trunkCount}, customerLinks={customerCount}");
+		((MelonBase)this).LoggerInstance.Msg($"Server->Network->Customer complete: customerLinks={customerCount}");
 		QueueSaveTopology();
 		ShowRackDetail();
 	}
@@ -2461,8 +2502,9 @@ public class RackBuilderCore : MelonMod
 
 	private static int GetSwitchInstanceId(CableLink port)
 	{
+		// Returns 0 as sentinel (invalid). Unity GetInstanceID() can return negative values in Unity 2021+.
 		if ((UnityEngine.Object)(object)port == (UnityEngine.Object)null || (UnityEngine.Object)(object)port.parentSwitch == (UnityEngine.Object)null)
-			return -1;
+			return 0;
 		return ((UnityEngine.Object)(object)port.parentSwitch).GetInstanceID();
 	}
 
@@ -2479,7 +2521,7 @@ public class RackBuilderCore : MelonMod
 			if (compatibility != null && !compatibility(candidate))
 				continue;
 			int swId = GetSwitchInstanceId(candidate);
-			int used = (swId > 0 && switchUsage.TryGetValue(swId, out int val)) ? val : 0;
+			int used = (swId != 0 && switchUsage.TryGetValue(swId, out int val)) ? val : 0;
 			float dist = (((Component)candidate).transform.position - ((Component)targetPort).transform.position).sqrMagnitude;
 			float score = dist + used * 25f;
 			if (score < bestScore)
@@ -2885,9 +2927,21 @@ public class RackBuilderCore : MelonMod
 		}
 		AddSpacer();
 		if (selectedRackRole == RackRoleNetwork)
-			AddColorLabel($"  Connect Network Rack to Customer: ({num15} switches need uplink)", Color.white);
+		{
+			AddColorLabel($"  Connect Network Rack → Customer: ({num15} switches ready)", Color.white);
+		}
 		else
-			AddColorLabel($"  Connect Server Rack via Network Rack to Customer: ({num15} source switches)", Color.white);
+		{
+			AddColorLabel($"  Connect Server Rack → Network Rack: ({num15} source switches)", Color.white);
+			AddClickableRow("  AUTO-WIRE → nearest NETWORK rack (trunk only)", new Color(0.2f, 0.3f, 0.15f), delegate
+			{
+				Rack net = AutoWireServerToNetworkRack();
+				QueueSaveTopology();
+				ShowRackDetail();
+			});
+			AddSpacer();
+			AddColorLabel($"  Connect Server Rack → Network Rack → Customer:", Color.white);
+		}
 		bool flag4 = false;
 		foreach (CustomerBase item15 in GetCustomerSnapshot())
 		{
@@ -3358,23 +3412,46 @@ public class RackBuilderCore : MelonMod
 				patchPairs.Add((port, paired, panelId));
 			}
 		}
-		List<int> patchPanelOrder = patchPairs.Select(((CableLink nearPort, CableLink farPort, int panelId) p) => p.panelId).Distinct().ToList();
-		patchPanelOrder.Sort();
+		// Sort patch panels and switches by physical Y position (descending = top of rack first = group A).
+		// Instance IDs are arbitrary runtime integers and must NOT be used for A/B ordering.
+		Dictionary<int, float> panelYPos = new Dictionary<int, float>();
+		foreach (PatchPanel pp in rackPatchPanels)
+		{
+			if ((UnityEngine.Object)(object)pp == (UnityEngine.Object)null) continue;
+			panelYPos[((UnityEngine.Object)(object)pp).GetInstanceID()] = ((Component)pp).transform.position.y;
+		}
+		List<int> patchPanelOrder = patchPairs
+			.Select(((CableLink nearPort, CableLink farPort, int panelId) p) => p.panelId)
+			.Distinct()
+			.OrderByDescending((int id) => panelYPos.TryGetValue(id, out float y) ? y : 0f)
+			.ToList();
+
+		Dictionary<int, float> switchYPos = new Dictionary<int, float>();
+		foreach (NetworkSwitch sw in rackSwitches)
+		{
+			if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null) continue;
+			switchYPos[((UnityEngine.Object)(object)sw).GetInstanceID()] = ((Component)sw).transform.position.y;
+		}
 		List<int> orderedSwitchIds = list2
 			.Select((CableLink p) => GetSwitchInstanceId(p))
-			.Where((int id) => id > 0)
+			.Where((int id) => id != 0)
 			.Distinct()
-			.OrderBy((int id) => id)
+			.OrderByDescending((int id) => switchYPos.TryGetValue(id, out float y) ? y : 0f)
 			.ToList();
+
 		Dictionary<int, int> switchUsage = new Dictionary<int, int>();
 		((MelonBase)this).LoggerInstance.Msg($"Auto-wire: {list.Count} server ports, {list2.Count} switch ports");
+		((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack] PP order (A→B by Y): [{string.Join(", ", patchPanelOrder.Select((int id) => $"{id}(y={( panelYPos.TryGetValue(id, out float py) ? py.ToString("F1") : "?")})") )}]");
+		((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack] SW order (A→B by Y): [{string.Join(", ", orderedSwitchIds.Select((int id) => $"{id}(y={( switchYPos.TryGetValue(id, out float sy) ? sy.ToString("F1") : "?")})") )}]");
 		int num = 0;
 		foreach (CableLink item6 in list)
 		{
 			bool routedViaPatchPanel = false;
 			int serverPortIndex = GetServerPortIndex(item6);
 			int preferredGroup = (serverPortIndex >= 0) ? (serverPortIndex % 2) : 0; // 0=A, 1=B
-			int preferredPanelId = (patchPanelOrder.Count > 0 && serverPortIndex >= 0) ? patchPanelOrder[serverPortIndex % patchPanelOrder.Count] : -1;
+			int preferredPanelId = (patchPanelOrder.Count > 0 && serverPortIndex >= 0) ? patchPanelOrder[serverPortIndex % patchPanelOrder.Count] : 0;
+			string srvName = (((UnityEngine.Object)(object)item6.parentServer != (UnityEngine.Object)null) ? ((UnityEngine.Object)((Component)item6.parentServer).gameObject).name : "?");
+			((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack][Port] srv={srvName} portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup == 0 ? "A" : "B")}) preferredPanel={preferredPanelId} patchPanelOrder.Count={patchPanelOrder.Count} orderedSwitchIds.Count={orderedSwitchIds.Count}");
 			for (int pass = 0; pass < 2 && !routedViaPatchPanel; pass++)
 			{
 				int bestPatchIndex = -1;
@@ -3384,7 +3461,7 @@ public class RackBuilderCore : MelonMod
 					var pair = patchPairs[patchIndex];
 					if ((UnityEngine.Object)(object)pair.nearPort == (UnityEngine.Object)null || (UnityEngine.Object)(object)pair.farPort == (UnityEngine.Object)null)
 						continue;
-					if (preferredPanelId > 0)
+					if (preferredPanelId != 0)
 					{
 						bool panelMatch = pair.panelId == preferredPanelId;
 						if ((pass == 0 && !panelMatch) || (pass == 1 && panelMatch))
@@ -3407,7 +3484,7 @@ public class RackBuilderCore : MelonMod
 						if (!PortsCompatible(patchFar, candidate))
 							return false;
 						int swIdCandidate = GetSwitchInstanceId(candidate);
-						if (orderedSwitchIds.Count >= 2 && swIdCandidate > 0)
+						if (orderedSwitchIds.Count >= 2 && swIdCandidate != 0)
 						{
 							int idx = orderedSwitchIds.IndexOf(swIdCandidate);
 							if (idx >= 0)
@@ -3445,7 +3522,7 @@ public class RackBuilderCore : MelonMod
 					if (!PortsCompatible(patchFar2, candidate))
 						return false;
 					int swIdCandidate = GetSwitchInstanceId(candidate);
-					if (orderedSwitchIds.Count >= 2 && swIdCandidate > 0)
+					if (orderedSwitchIds.Count >= 2 && swIdCandidate != 0)
 					{
 						int idx = orderedSwitchIds.IndexOf(swIdCandidate);
 						if (idx >= 0)
@@ -3472,9 +3549,10 @@ public class RackBuilderCore : MelonMod
 						routedViaPatchPanel = true;
 						patchPairs.RemoveAt(bestPatchIndex);
 						int swId = GetSwitchInstanceId(switchPort);
-						if (swId > 0)
+						if (swId != 0)
 							switchUsage[swId] = switchUsage.TryGetValue(swId, out int used) ? used + 1 : 1;
-						((MelonBase)this).LoggerInstance.Msg("  Wired server via patch panel");
+						int swIdx = orderedSwitchIds.IndexOf(swId);
+						((MelonBase)this).LoggerInstance.Msg($"  Wired server via patch panel: portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup==0?"A":"B")}) panel={bestPair.panelId} swId={swId} swIdx={swIdx}(={( swIdx>=0?(swIdx%2==0?"A":"B"):"?")})");
 						break;
 					}
 				}
@@ -3494,14 +3572,14 @@ public class RackBuilderCore : MelonMod
 				if (!IsPortReadyForCable(val4) || !PortsCompatible(item6, val4))
 					continue;
 				int swId = GetSwitchInstanceId(val4);
-				if (orderedSwitchIds.Count >= 2 && swId > 0)
+				if (orderedSwitchIds.Count >= 2 && swId != 0)
 				{
 					int idx = orderedSwitchIds.IndexOf(swId);
 					if (idx >= 0 && (idx % 2) != preferredGroup)
 						continue;
 				}
 				float d = (((Component)val4).transform.position - ((Component)item6).transform.position).sqrMagnitude;
-				int used = (swId > 0 && switchUsage.TryGetValue(swId, out int cnt)) ? cnt : 0;
+				int used = (swId != 0 && switchUsage.TryGetValue(swId, out int cnt)) ? cnt : 0;
 				float score = d + used * 25f;
 				if (score < bestDirectDist)
 				{
@@ -3519,7 +3597,7 @@ public class RackBuilderCore : MelonMod
 						continue;
 					float d = (((Component)val4).transform.position - ((Component)item6).transform.position).sqrMagnitude;
 					int swId = GetSwitchInstanceId(val4);
-					int used = (swId > 0 && switchUsage.TryGetValue(swId, out int cnt)) ? cnt : 0;
+					int used = (swId != 0 && switchUsage.TryGetValue(swId, out int cnt)) ? cnt : 0;
 					float score = d + used * 25f;
 					if (score < bestDirectDist)
 					{
@@ -3542,9 +3620,10 @@ public class RackBuilderCore : MelonMod
 				{
 					num++;
 					int swId2 = GetSwitchInstanceId(val3);
-					if (swId2 > 0)
+					if (swId2 != 0)
 						switchUsage[swId2] = switchUsage.TryGetValue(swId2, out int used2) ? used2 + 1 : 1;
-					((MelonBase)this).LoggerInstance.Msg($"  Wired switch -> server (match idx {value})");
+					int swIdx2 = orderedSwitchIds.IndexOf(swId2);
+					((MelonBase)this).LoggerInstance.Msg($"  Wired switch->server (direct): portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup==0?"A":"B")}) swId={swId2} swIdx={swIdx2}(={(swIdx2>=0?(swIdx2%2==0?"A":"B"):"?")})");
 				}
 			}
 			catch (Exception ex)

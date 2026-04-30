@@ -1,0 +1,6 @@
+﻿- Save/reload cable persistence hardening (menu reload + startup restore)
+- Clip-aware cable route restoration through rack paths
+- Faster restore-only load path to avoid freezes
+- Rack role system (server/network) and role-aware customer wiring
+- Auto-wire A/B distribution bias for server dual links
+- Build hash: EB2881104849D8499E7A3DD8A9D3F770D1A25BD80A006C94342961250A91199C
