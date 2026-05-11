@@ -14,12 +14,25 @@ using MelonLoader;
 using UnityEngine;
 using UnityEngine.Events;
 using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
 
 namespace RackBuilderMod;
 
 public class RackBuilderCore : MelonMod
 {
+	private readonly struct RackColorChoice
+	{
+		public readonly string Name;
+		public readonly Color Color;
+
+		public RackColorChoice(string name, Color color)
+		{
+			Name = name;
+			Color = color;
+		}
+	}
+
 	public struct ItemChoice
 	{
 		public string name;
@@ -91,7 +104,29 @@ public class RackBuilderCore : MelonMod
 		[JsonPropertyName("racks")]
 		public List<RackRoleEntry> Racks { get; set; } = new List<RackRoleEntry>();
 	}
-	
+
+	[Serializable]
+	public class RackColorEntry
+	{
+		[JsonPropertyName("rackKey")]
+		public string RackKey { get; set; }
+
+		[JsonPropertyName("colorR")]
+		public float ColorR { get; set; }
+
+		[JsonPropertyName("colorG")]
+		public float ColorG { get; set; }
+
+		[JsonPropertyName("colorB")]
+		public float ColorB { get; set; }
+	}
+
+	[Serializable]
+	public class RackColorData
+	{
+		[JsonPropertyName("racks")]
+		public List<RackColorEntry> Racks { get; set; } = new List<RackColorEntry>();
+	}
 
 	private bool _integrated;
 	private bool _startupCableRestoreQueued;
@@ -189,6 +224,50 @@ public class RackBuilderCore : MelonMod
 	private bool _rackRolesLoaded;
 
 	private Dictionary<string, string> _rackRolesByKey = new Dictionary<string, string>();
+
+	private bool _rackColorsLoaded;
+
+	private Dictionary<string, Color> _rackColorsByKey = new Dictionary<string, Color>();
+
+	private bool _inputSystemHotkeyWarningLogged;
+
+	private readonly RackColorChoice[] _rackColorChoices = new RackColorChoice[]
+	{
+		new RackColorChoice("Graphite", new Color(0.18f, 0.2f, 0.23f)),
+		new RackColorChoice("Arctic", new Color(0.75f, 0.79f, 0.85f)),
+		new RackColorChoice("Ocean", new Color(0.18f, 0.38f, 0.62f)),
+		new RackColorChoice("Forest", new Color(0.2f, 0.42f, 0.28f)),
+		new RackColorChoice("Amber", new Color(0.62f, 0.43f, 0.18f)),
+		new RackColorChoice("Crimson", new Color(0.54f, 0.2f, 0.22f))
+	};
+
+	private readonly RackColorChoice[] _cableColors = new RackColorChoice[]
+	{
+		new RackColorChoice("Black", new Color(0.12f, 0.12f, 0.12f)),
+		new RackColorChoice("Blue", new Color(0.2f, 0.4f, 0.8f)),
+		new RackColorChoice("Red", new Color(0.7f, 0.15f, 0.15f)),
+		new RackColorChoice("Green", new Color(0.15f, 0.6f, 0.2f)),
+		new RackColorChoice("Yellow", new Color(0.8f, 0.7f, 0.1f)),
+		new RackColorChoice("Orange", new Color(0.8f, 0.4f, 0.05f)),
+		new RackColorChoice("Purple", new Color(0.55f, 0.15f, 0.6f)),
+		new RackColorChoice("White", new Color(0.85f, 0.85f, 0.85f))
+	};
+
+	private int _selectedRackColorIndex;
+
+	private Color _customRackColor = new Color(0.18f, 0.2f, 0.23f);
+
+	private bool _bulkEditMode;
+
+	private int _cableColorIndex;
+
+	private bool _bulkDragSelecting;
+
+	private bool _bulkDragTargetSelectState;
+
+	private readonly HashSet<int> _bulkSelectedServerAnchors = new HashSet<int>();
+
+	private readonly HashSet<Rack> _bulkSelectedRacks = new HashSet<Rack>();
 
 	private void LogPlacementDebugState(string stage, Server srv, NetworkSwitch sw)
 	{
@@ -295,6 +374,7 @@ public class RackBuilderCore : MelonMod
 		_allRacks.Clear();
 		_pendingRemoveMount = null;
 		_pendingBulkClearConfirmation = false;
+		_bulkSelectedRacks.Clear();
 		_cartQty.Clear();
 		_itemChoices.Clear();
 		_cachedRackRailClips = null;
@@ -371,6 +451,82 @@ public class RackBuilderCore : MelonMod
 			int customerCount = _cachedCustomerSnapshot.Count;
 			((MelonBase)this).LoggerInstance.Msg($"[Perf][OnUpdate] total={overall.ElapsedMilliseconds}ms integrated={_integrated} restoreQueued={_startupCableRestoreQueued} detailPage={_onDetailPage} selectedRack={((UnityEngine.Object)(object)_selectedRack != (UnityEngine.Object)null)} racks={rackCount} customers={customerCount} frame={Time.frameCount}");
 		}
+		if (_integrated && (UnityEngine.Object)(object)_rackScreen != (UnityEngine.Object)null && IsRackManagerTogglePressed())
+		{
+			if (_rackScreen.activeSelf)
+			{
+				_rackScreen.SetActive(false);
+				_onDetailPage = false;
+				_selectedRack = null;
+				_pendingBulkClearConfirmation = false;
+				if ((UnityEngine.Object)(object)_shop != (UnityEngine.Object)null && (UnityEngine.Object)(object)_shop.mainScreen != (UnityEngine.Object)null)
+					_shop.mainScreen.SetActive(true);
+			}
+			else if ((UnityEngine.Object)(object)_shop != (UnityEngine.Object)null)
+			{
+				_shop.mainScreen.SetActive(false);
+				_rackScreen.SetActive(true);
+				_onDetailPage = false;
+				BuildItemChoices();
+				ShowRackList();
+			}
+		}
+	}
+
+	private bool IsRackManagerTogglePressed()
+	{
+		try
+		{
+			Keyboard keyboard = Keyboard.current;
+			if (keyboard == null)
+				return false;
+			return keyboard.rKey.wasPressedThisFrame;
+		}
+		catch (Exception ex)
+		{
+			if (!_inputSystemHotkeyWarningLogged)
+			{
+				_inputSystemHotkeyWarningLogged = true;
+				((MelonBase)this).LoggerInstance.Warning("Input System hotkey polling failed once: " + ex.Message + " (Rack Manager remains available via laptop UI button).");
+			}
+			return false;
+		}
+	}
+
+	private void RestoreSavedRackColors()
+	{
+		EnsureRackColorsLoaded();
+		if (_rackColorsByKey.Count == 0)
+			return;
+		int restored = 0;
+		foreach (Rack rack in GetRackSnapshot())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null) continue;
+			string key = BuildRackRoleKey(rack);
+			if (string.IsNullOrEmpty(key)) continue;
+			if (_rackColorsByKey.TryGetValue(key, out Color saved))
+			{
+				ApplyRackColor(rack, saved);
+				restored++;
+			}
+		}
+		if (restored > 0)
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Restored rack colors for {restored} racks");
+	}
+
+	private void PreWarmCableClips()
+	{
+		if (_cachedOverheadClips != null)
+			return;
+		List<CableLink> clips = new List<CableLink>();
+		foreach (CableLink cl in UnityEngine.Object.FindObjectsOfType<CableLink>(true))
+		{
+			if ((UnityEngine.Object)(object)cl == (UnityEngine.Object)null) continue;
+			if (((UnityEngine.Object)cl).name.Contains("Clip") && ((UnityEngine.Object)((Component)cl).gameObject).name.Contains("Clip"))
+				clips.Add(cl);
+		}
+		_cachedOverheadClips = clips;
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] PreWarmCableClips: cached {clips.Count} overhead clips");
 	}
 
 	private void TryQueueStartupCableRestore()
@@ -392,6 +548,9 @@ public class RackBuilderCore : MelonMod
 		}
 		if (rackCount == 0)
 			return;
+
+		PreWarmCableClips();
+		RestoreSavedRackColors();
 
 		if (frame < _nextStartupTopologyCheckFrame)
 			return;
@@ -846,6 +1005,11 @@ public class RackBuilderCore : MelonMod
 		return Path.Combine(UnityEngine.Application.persistentDataPath, "RackRoles.json");
 	}
 
+	private static string GetRackColorsFilePath()
+	{
+		return Path.Combine(UnityEngine.Application.persistentDataPath, "RackColors.json");
+	}
+
 	private string BuildRackRoleKey(Rack rack)
 	{
 		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || rack.positions == null)
@@ -935,6 +1099,234 @@ public class RackBuilderCore : MelonMod
 		_rackRolesByKey[key] = newRole;
 		SaveRackRoles();
 		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Rack role set to {newRole} for key {key}");
+	}
+
+	private void EnsureRackColorsLoaded()
+	{
+		if (_rackColorsLoaded)
+			return;
+		_rackColorsLoaded = true;
+		_rackColorsByKey.Clear();
+		try
+		{
+			string path = GetRackColorsFilePath();
+			if (!File.Exists(path))
+				return;
+			string json = File.ReadAllText(path);
+			RackColorData data = JsonSerializer.Deserialize<RackColorData>(json);
+			if (data?.Racks == null)
+				return;
+			foreach (RackColorEntry entry in data.Racks)
+			{
+				if (entry == null || string.IsNullOrEmpty(entry.RackKey))
+					continue;
+				_rackColorsByKey[entry.RackKey] = new Color(entry.ColorR, entry.ColorG, entry.ColorB);
+			}
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Failed to load rack colors: " + ex.Message);
+		}
+	}
+
+	private void SaveRackColors()
+	{
+		try
+		{
+			RackColorData data = new RackColorData();
+			foreach (KeyValuePair<string, Color> kv in _rackColorsByKey)
+			{
+				data.Racks.Add(new RackColorEntry
+				{
+					RackKey = kv.Key,
+					ColorR = kv.Value.r,
+					ColorG = kv.Value.g,
+					ColorB = kv.Value.b
+				});
+			}
+			string json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
+			File.WriteAllText(GetRackColorsFilePath(), json);
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Failed to save rack colors: " + ex.Message);
+		}
+	}
+
+	private bool TryGetSavedRackColor(Rack rack, out Color color)
+	{
+		color = Color.white;
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+			return false;
+		EnsureRackColorsLoaded();
+		string key = BuildRackRoleKey(rack);
+		if (string.IsNullOrEmpty(key))
+			return false;
+		return _rackColorsByKey.TryGetValue(key, out color);
+	}
+
+	private RackColorChoice GetSelectedRackColorChoice()
+	{
+		if (_rackColorChoices.Length == 0)
+			return new RackColorChoice("Default", new Color(0.18f, 0.2f, 0.23f));
+		if (_selectedRackColorIndex < 0 || _selectedRackColorIndex >= _rackColorChoices.Length)
+			_selectedRackColorIndex = 0;
+		return _rackColorChoices[_selectedRackColorIndex];
+	}
+
+	private Color GetConfiguredRackColor()
+	{
+		return _customRackColor;
+	}
+
+	private void CycleRackColorChoice()
+	{
+		if (_rackColorChoices.Length == 0)
+			return;
+		_selectedRackColorIndex++;
+		if (_selectedRackColorIndex >= _rackColorChoices.Length)
+			_selectedRackColorIndex = 0;
+		_customRackColor = _rackColorChoices[_selectedRackColorIndex].Color;
+	}
+
+	private RackColorChoice GetSelectedCableColor()
+	{
+		if (_cableColors.Length == 0)
+			return new RackColorChoice("Blue", new Color(0.2f, 0.4f, 0.8f));
+		if (_cableColorIndex < 0 || _cableColorIndex >= _cableColors.Length)
+			_cableColorIndex = 0;
+		return _cableColors[_cableColorIndex];
+	}
+
+	private void CycleCableColorChoice()
+	{
+		if (_cableColors.Length == 0)
+			return;
+		_cableColorIndex++;
+		if (_cableColorIndex >= _cableColors.Length)
+			_cableColorIndex = 0;
+	}
+
+	private static float Clamp01(float value)
+	{
+		if (value < 0f)
+			return 0f;
+		if (value > 1f)
+			return 1f;
+		return value;
+	}
+
+	private static Color GetReadableTextColor(Color bg)
+	{
+		float luminance = 0.2126f * bg.r + 0.7152f * bg.g + 0.0722f * bg.b;
+		return (luminance > 0.58f) ? new Color(0.1f, 0.1f, 0.1f) : new Color(0.95f, 0.95f, 0.95f);
+	}
+
+	private static Color GetHoverColor(Color baseColor)
+	{
+		return new Color(
+			Clamp01(baseColor.r + 0.12f),
+			Clamp01(baseColor.g + 0.12f),
+			Clamp01(baseColor.b + 0.12f),
+			1f);
+	}
+
+	private bool TryGetRackColor(Rack rack, out Color color)
+	{
+		color = Color.white;
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+			return false;
+		Il2CppArrayBase<Renderer> renderers = ((Component)rack).GetComponentsInChildren<Renderer>(true);
+		if (renderers == null)
+			return false;
+		foreach (Renderer renderer in renderers)
+		{
+			if ((UnityEngine.Object)(object)renderer == (UnityEngine.Object)null)
+				continue;
+			Material[] mats = renderer.materials;
+			if (mats == null)
+				continue;
+			foreach (Material mat in mats)
+			{
+				if ((UnityEngine.Object)(object)mat == (UnityEngine.Object)null)
+					continue;
+				if (mat.HasProperty("_BaseColor"))
+				{
+					color = mat.GetColor("_BaseColor");
+					return true;
+				}
+				if (mat.HasProperty("_Color"))
+				{
+					color = mat.GetColor("_Color");
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private Color GetRackPreviewColor(Rack rack)
+	{
+		if (TryGetRackColor(rack, out Color color))
+			return color;
+		return new Color(0.15f, 0.4f, 0.15f);
+	}
+
+	private bool IsCtrlHeld()
+	{
+		Keyboard keyboard = Keyboard.current;
+		if (keyboard == null)
+			return false;
+		return keyboard.leftCtrlKey.isPressed || keyboard.rightCtrlKey.isPressed;
+	}
+
+	private void SetBulkServerSelection(int anchor, bool selected)
+	{
+		if (selected)
+			_bulkSelectedServerAnchors.Add(anchor);
+		else
+			_bulkSelectedServerAnchors.Remove(anchor);
+	}
+
+	private bool ApplyRackColor(Rack rack, Color color)
+	{
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+			return false;
+		bool changed = false;
+		Il2CppArrayBase<Renderer> renderers = ((Component)rack).GetComponentsInChildren<Renderer>(true);
+		if (renderers == null)
+			return false;
+		foreach (Renderer renderer in renderers)
+		{
+			if ((UnityEngine.Object)(object)renderer == (UnityEngine.Object)null)
+				continue;
+			if (renderer.GetComponentInParent<UsableObject>() != null)
+				continue;
+			Material[] mats = renderer.materials;
+			if (mats == null)
+				continue;
+			foreach (Material mat in mats)
+			{
+				if ((UnityEngine.Object)(object)mat == (UnityEngine.Object)null)
+					continue;
+				if (mat.renderQueue >= 3000)
+					continue;
+				bool materialChanged = false;
+				if (mat.HasProperty("_BaseColor"))
+				{
+					mat.SetColor("_BaseColor", color);
+					materialChanged = true;
+				}
+				if (mat.HasProperty("_Color"))
+				{
+					mat.SetColor("_Color", color);
+					materialChanged = true;
+				}
+				if (materialChanged)
+					changed = true;
+			}
+		}
+		return changed;
 	}
 
 	private List<UsableObject> CollectRackUsableObjects(Rack rack)
@@ -1851,6 +2243,9 @@ public class RackBuilderCore : MelonMod
 			_onDetailPage = false;
 			_selectedRack = null;
 			_pendingBulkClearConfirmation = false;
+			_bulkDragSelecting = false;
+			_bulkSelectedServerAnchors.Clear();
+			_bulkSelectedRacks.Clear();
 			ShowRackList();
 		}
 		else
@@ -1903,6 +2298,63 @@ public class RackBuilderCore : MelonMod
 			return;
 		}
 		AddTitle("Data Center Floor Plan");
+		RackColorChoice rackColor = GetSelectedRackColorChoice();
+		AddClickableRow($"  Rack Color: {rackColor.Name}  (click to cycle)", rackColor.Color * 0.75f, delegate
+		{
+			CycleRackColorChoice();
+			ShowRackList();
+		});
+		AddColorLabel("  New racks will use the selected color", new Color(0.7f, 0.7f, 0.7f));
+		AddClickableRow($"  BULK EDIT MODE: {(_bulkEditMode ? "ON" : "OFF")}", _bulkEditMode ? new Color(0.48f, 0.25f, 0.1f) : new Color(0.2f, 0.2f, 0.2f), delegate
+		{
+			_bulkEditMode = !_bulkEditMode;
+			_bulkDragSelecting = false;
+			if (!_bulkEditMode)
+				_bulkSelectedRacks.Clear();
+			ShowRackList();
+		});
+		RackColorChoice cableColor = GetSelectedCableColor();
+		AddClickableRow($"  Cable Color: {cableColor.Name}", cableColor.Color * 0.75f, delegate
+		{
+			CycleCableColorChoice();
+			ShowRackList();
+		});
+		AddColorLabel("  Color used for new cables", new Color(0.7f, 0.7f, 0.7f));
+		if (_bulkEditMode)
+		{
+			AddSpacer();
+			AddColorLabel("  Bulk: Hold Ctrl and drag over racks to select multiple", new Color(0.9f, 0.75f, 0.45f));
+			if (_bulkSelectedRacks.Count > 0)
+			{
+				AddColorLabel($"  {_bulkSelectedRacks.Count} rack(s) selected", new Color(0.9f, 0.75f, 0.45f));
+				AddClickableRow("  EDIT ALL RACK-CONTENTS", new Color(0.35f, 0.5f, 0.7f), delegate
+				{
+					ShowBulkRackContents();
+				});
+				AddClickableRow($"  REMOVE ALL EQUIPMENT ({_bulkSelectedRacks.Count} racks)", new Color(0.55f, 0.15f, 0.15f), delegate
+				{
+					BulkRemoveAllEquipment();
+				});
+				AddClickableRow($"  SET RACK COLOR ({_bulkSelectedRacks.Count} racks)", new Color(0.4f, 0.3f, 0.6f), delegate
+				{
+					BulkSetRackColor();
+				});
+				AddClickableRow($"  MERGE SELECTED RACKS", new Color(0.25f, 0.45f, 0.35f), delegate
+				{
+					BulkOpenSelectedRacks();
+				});
+				AddClickableRow($"  REMOVE SELECTED RACKS ({_bulkSelectedRacks.Count} racks)", new Color(0.55f, 0.1f, 0.1f), delegate
+				{
+					BulkRemoveSelectedRacks();
+				});
+				AddClickableRow("  CLEAR SELECTION", new Color(0.25f, 0.25f, 0.25f), delegate
+				{
+					_bulkSelectedRacks.Clear();
+					ShowRackList();
+				});
+			}
+		}
+		AddSpacer();
 		int num = 0;
 		foreach (Wall item2 in GetWallSnapshot())
 		{
@@ -1965,7 +2417,7 @@ public class RackBuilderCore : MelonMod
 			long key = ((long)num5 << 32) | (uint)num6;
 			dictionary[key] = item6;
 		}
-		AddLabel($"  {_allRacks.Count} racks  |  Grey=empty  Green=installed  |  Click to manage");
+		AddLabel($"  {_allRacks.Count} racks  |  Grey=empty  Installed=Rackfarbe  |  Click to manage");
 		AddSpacer();
 		foreach (int item7 in list4)
 		{
@@ -2010,8 +2462,9 @@ public class RackBuilderCore : MelonMod
 					}
 					if (flag)
 					{
-						((Graphic)val10).color = new Color(0.15f, 0.4f, 0.15f);
-						colors.highlightedColor = new Color(0.25f, 0.55f, 0.25f);
+						Color rackPreviewColor = GetRackPreviewColor(componentInChildren);
+						((Graphic)val10).color = rackPreviewColor;
+						colors.highlightedColor = GetHoverColor(rackPreviewColor);
 						GameObject val12 = new GameObject("Util");
 						val12.transform.SetParent(val9.transform, false);
 						RectTransform val13 = val12.AddComponent<RectTransform>();
@@ -2023,19 +2476,33 @@ public class RackBuilderCore : MelonMod
 						((TMP_Text)val14).fontSize = 8f;
 						((TMP_Text)val14).alignment = (TextAlignmentOptions)514;
 						((TMP_Text)val14).enableWordWrapping = false;
-						((Graphic)val14).color = new Color(0.9f, 1f, 0.9f);
+						((Graphic)val14).color = GetReadableTextColor(rackPreviewColor);
 						((Graphic)val14).raycastTarget = false;
 						Rack r = componentInChildren;
 						RackMount m = value;
+						Image cellImage = val10;
+						Color originalRackColor = rackPreviewColor;
+						Color selectedRackColor = new Color(0.65f, 0.35f, 0.12f);
 						((UnityEvent)val11.onClick).AddListener((Action)delegate
 						{
-							if ((UnityEngine.Object)(object)r != (UnityEngine.Object)null)
+							if ((UnityEngine.Object)(object)r == (UnityEngine.Object)null) return;
+							if (_bulkEditMode && IsCtrlHeld())
 							{
-								_selectedRack = r;
-								_pendingBulkClearConfirmation = false;
-								_onDetailPage = true;
-								ShowRackDetail();
+								bool targetState = !_bulkSelectedRacks.Contains(r);
+								if (targetState)
+									_bulkSelectedRacks.Add(r);
+								else
+									_bulkSelectedRacks.Remove(r);
+								((Graphic)cellImage).color = targetState ? selectedRackColor : originalRackColor;
+								ShowRackList();
+								return;
 							}
+							_selectedRack = r;
+							_pendingBulkClearConfirmation = false;
+							_bulkDragSelecting = false;
+							_bulkSelectedServerAnchors.Clear();
+							_onDetailPage = true;
+							ShowRackDetail();
 						});
 						EventTrigger val15 = val9.AddComponent<EventTrigger>();
 						EventTrigger.Entry val16 = new EventTrigger.Entry();
@@ -2052,6 +2519,54 @@ public class RackBuilderCore : MelonMod
 							}
 						});
 						val15.triggers.Add(val16);
+						EventTrigger.Entry downEntry = new EventTrigger.Entry();
+						downEntry.eventID = EventTriggerType.PointerDown;
+						((UnityEvent<BaseEventData>)(object)downEntry.callback).AddListener((Action<BaseEventData>)delegate(BaseEventData data)
+						{
+							if (!_bulkEditMode || !IsCtrlHeld()) return;
+							PointerEventData ped = ((Il2CppObjectBase)data).TryCast<PointerEventData>();
+							if (ped != null && (int)ped.button != 0) return;
+							_bulkDragSelecting = true;
+							_bulkDragTargetSelectState = !_bulkSelectedRacks.Contains(r);
+							if (_bulkDragTargetSelectState)
+								_bulkSelectedRacks.Add(r);
+							else
+								_bulkSelectedRacks.Remove(r);
+							((Graphic)cellImage).color = _bulkSelectedRacks.Contains(r) ? selectedRackColor : originalRackColor;
+						});
+						val15.triggers.Add(downEntry);
+						EventTrigger.Entry enterEntry = new EventTrigger.Entry();
+						enterEntry.eventID = EventTriggerType.PointerEnter;
+						((UnityEvent<BaseEventData>)(object)enterEntry.callback).AddListener((Action<BaseEventData>)delegate
+						{
+							if (!_bulkEditMode || !_bulkDragSelecting || !IsCtrlHeld()) return;
+							if (_bulkDragTargetSelectState)
+								_bulkSelectedRacks.Add(r);
+							else
+								_bulkSelectedRacks.Remove(r);
+							((Graphic)cellImage).color = _bulkSelectedRacks.Contains(r) ? selectedRackColor : originalRackColor;
+						});
+						val15.triggers.Add(enterEntry);
+						EventTrigger.Entry upEntry = new EventTrigger.Entry();
+						upEntry.eventID = EventTriggerType.PointerUp;
+						((UnityEvent<BaseEventData>)(object)upEntry.callback).AddListener((Action<BaseEventData>)delegate
+						{
+							bool wasDragging = _bulkDragSelecting;
+							_bulkDragSelecting = false;
+							if (wasDragging && _bulkEditMode && _onDetailPage == false)
+								ShowRackList();
+						});
+						val15.triggers.Add(upEntry);
+						EventTrigger.Entry endDragEntry = new EventTrigger.Entry();
+						endDragEntry.eventID = EventTriggerType.EndDrag;
+						((UnityEvent<BaseEventData>)(object)endDragEntry.callback).AddListener((Action<BaseEventData>)delegate
+						{
+							bool wasDragging = _bulkDragSelecting;
+							_bulkDragSelecting = false;
+							if (wasDragging && _bulkEditMode && _onDetailPage == false)
+								ShowRackList();
+						});
+						val15.triggers.Add(endDragEntry);
 					}
 					else
 					{
@@ -2154,6 +2669,13 @@ public class RackBuilderCore : MelonMod
 		{
 			mount.isRackInstantiated = false;
 			return;
+		}
+		string rackKey = BuildRackRoleKey(componentInChildren);
+		if (!string.IsNullOrEmpty(rackKey))
+		{
+			EnsureRackColorsLoaded();
+			if (_rackColorsByKey.Remove(rackKey))
+				SaveRackColors();
 		}
 		CablePositions val = GetCablePositionsCached();
 		int num = 0;
@@ -2391,6 +2913,20 @@ public class RackBuilderCore : MelonMod
 				}
 				return false;
 			}
+
+			try
+			{
+				Color cableCol = GetSelectedCableColor().Color;
+				if (cablePositions.cableMaterials.TryGetValue(cableId, out Material cableMat))
+				{
+					if (cableMat.HasProperty("_BaseColor"))
+						cableMat.SetColor("_BaseColor", cableCol);
+					if (cableMat.HasProperty("_Color"))
+						cableMat.SetColor("_Color", cableCol);
+				}
+			}
+			catch { }
+
 			startPort.cableIDsOnLink = cableId;
 			endPort.cableIDsOnLink = cableId;
 			_autoWireProtectedCableIds.Add(cableId);
@@ -2531,6 +3067,323 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 		return best;
+	}
+
+	private void BulkRemoveAllEquipment()
+	{
+		int totalRemoved = 0;
+		foreach (Rack rack in _bulkSelectedRacks.ToList())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null) continue;
+			RackMount mount = ((Component)rack).GetComponentInParent<RackMount>();
+			if ((UnityEngine.Object)(object)mount == (UnityEngine.Object)null) continue;
+			if (ClearRackEquipment(mount))
+				totalRemoved++;
+		}
+		((MelonBase)this).LoggerInstance.Msg($"[Bulk] Removed equipment from {totalRemoved}/{_bulkSelectedRacks.Count} racks");
+		InvalidateRackSnapshot();
+		SaveCableTopology();
+		_bulkSelectedRacks.Clear();
+		ShowRackList();
+	}
+
+	private void BulkSetRackColor()
+	{
+		Color color = GetConfiguredRackColor();
+		int applied = 0;
+		EnsureRackColorsLoaded();
+		foreach (Rack rack in _bulkSelectedRacks.ToList())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null) continue;
+			if (ApplyRackColor(rack, color))
+			{
+				applied++;
+				string key = BuildRackRoleKey(rack);
+				if (!string.IsNullOrEmpty(key))
+					_rackColorsByKey[key] = color;
+			}
+		}
+		SaveRackColors();
+		((MelonBase)this).LoggerInstance.Msg($"[Bulk] Applied color to {applied}/{_bulkSelectedRacks.Count} racks");
+		_bulkSelectedRacks.Clear();
+		ShowRackList();
+	}
+
+	private void BulkOpenSelectedRacks()
+	{
+		List<Rack> selected = _bulkSelectedRacks.Where((Rack r) => (UnityEngine.Object)(object)r != (UnityEngine.Object)null).ToList();
+		if (selected.Count == 0)
+		{
+			ShowRackList();
+			return;
+		}
+		if (selected.Count == 1)
+		{
+			_selectedRack = selected[0];
+			_pendingBulkClearConfirmation = false;
+			_bulkDragSelecting = false;
+			_bulkSelectedServerAnchors.Clear();
+			_bulkSelectedRacks.Clear();
+			_onDetailPage = true;
+			ShowRackDetail();
+			return;
+		}
+
+		Rack target = selected[0];
+		int moved = 0;
+		int skipped = 0;
+
+		for (int i = 1; i < selected.Count; i++)
+		{
+			Rack source = selected[i];
+			if ((UnityEngine.Object)(object)source == (UnityEngine.Object)null) continue;
+
+			List<UsableObject> equipment = CollectRackUsableObjects(source);
+			equipment.Sort((a, b) => b.storedPosition.CompareTo(a.storedPosition));
+
+			foreach (UsableObject uo in equipment)
+			{
+				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
+				int size = uo.sizeInU;
+				if (size < 1) size = 1;
+				int currentSlot = uo.storedPosition;
+
+				if (source.isPositionUsed != null && currentSlot >= 0)
+				{
+					for (int c = 0; c < size && currentSlot + c < ((Il2CppArrayBase<int>)(object)source.isPositionUsed).Length; c++)
+						((Il2CppArrayBase<int>)(object)source.isPositionUsed)[currentSlot + c] = 0;
+				}
+
+				int freeSlot = FindFreeSlot(target, size);
+				if (freeSlot < 0)
+				{
+					skipped++;
+					continue;
+				}
+
+				RackPosition targetPos = ((Il2CppArrayBase<RackPosition>)(object)target.positions)[freeSlot];
+				if ((UnityEngine.Object)(object)targetPos == (UnityEngine.Object)null)
+				{
+					skipped++;
+					continue;
+				}
+
+				((Component)uo).transform.SetParent(((Component)targetPos).transform);
+				((Component)uo).transform.localPosition = Vector3.zero;
+				((Component)uo).transform.localRotation = Quaternion.identity;
+
+				Rigidbody rb = ((Component)uo).GetComponent<Rigidbody>();
+				if ((UnityEngine.Object)(object)rb != (UnityEngine.Object)null)
+				{
+					rb.isKinematic = true;
+					rb.useGravity = false;
+				}
+
+				uo.currentRackPosition = targetPos;
+				uo.rackPositionUID = targetPos.rackPosGlobalUID;
+				uo.storedPosition = freeSlot;
+
+				if (target.isPositionUsed != null && freeSlot >= 0)
+				{
+					for (int c = 0; c < size && freeSlot + c < ((Il2CppArrayBase<int>)(object)target.isPositionUsed).Length; c++)
+						((Il2CppArrayBase<int>)(object)target.isPositionUsed)[freeSlot + c] = 1;
+				}
+
+				moved++;
+			}
+
+			if (source.isPositionUsed != null)
+			{
+				for (int j = 0; j < ((Il2CppArrayBase<int>)(object)source.isPositionUsed).Length; j++)
+					((Il2CppArrayBase<int>)(object)source.isPositionUsed)[j] = 0;
+			}
+		}
+
+		_selectedRack = target;
+		_pendingBulkClearConfirmation = false;
+		_bulkDragSelecting = false;
+		_bulkSelectedServerAnchors.Clear();
+		_bulkSelectedRacks.Clear();
+		_onDetailPage = true;
+
+		if (skipped > 0)
+			((MelonBase)this).LoggerInstance.Msg($"[Bulk] Merged {moved} items into {((UnityEngine.Object)((Component)target).gameObject).name} ({skipped} skipped — not enough space)");
+		else
+			((MelonBase)this).LoggerInstance.Msg($"[Bulk] Merged {moved} items into {((UnityEngine.Object)((Component)target).gameObject).name}");
+
+		ShowRackDetail();
+	}
+
+	private int FindFreeSlot(Rack rack, int size)
+	{
+		if (rack.positions == null || rack.isPositionUsed == null)
+			return -1;
+		int total = ((Il2CppArrayBase<RackPosition>)(object)rack.positions).Length;
+		for (int slot = 0; slot <= total - size; slot++)
+		{
+			bool free = true;
+			for (int check = 0; check < size; check++)
+			{
+				if (((Il2CppArrayBase<int>)(object)rack.isPositionUsed)[slot + check] != 0)
+				{
+					free = false;
+					break;
+				}
+			}
+			if (free)
+				return slot;
+		}
+		return -1;
+	}
+
+	private void BulkRemoveSelectedRacks()
+	{
+		int removed = 0;
+		foreach (Rack rack in _bulkSelectedRacks.ToList())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null) continue;
+			RackMount mount = ((Component)rack).GetComponentInParent<RackMount>();
+			if ((UnityEngine.Object)(object)mount == (UnityEngine.Object)null) continue;
+			RemoveRackAtMount(mount);
+			removed++;
+		}
+		((MelonBase)this).LoggerInstance.Msg($"[Bulk] Removed {removed} racks");
+		InvalidateRackSnapshot();
+		SaveCableTopology();
+		_bulkSelectedRacks.Clear();
+		ShowRackList();
+	}
+
+	private void ShowBulkRackContents()
+	{
+		ClearContent();
+		AddTitle("Bulk Edit: Rack Contents");
+
+		List<(Rack rack, int anchor, int size, string label, string colorType, UsableObject uo)> allServers = new List<(Rack, int, int, string, string, UsableObject)>();
+
+		foreach (Rack rack in _bulkSelectedRacks.ToList())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || rack.positions == null) continue;
+			string rackName = rack.name ?? "Unknown";
+			int num = ((Il2CppArrayBase<RackPosition>)(object)rack.positions).Length;
+			HashSet<int> slotsFound = new HashSet<int>();
+			for (int j = 0; j < num; j++)
+			{
+				if (slotsFound.Contains(j)) continue;
+				RackPosition rp = ((Il2CppArrayBase<RackPosition>)(object)rack.positions)[j];
+				if ((UnityEngine.Object)(object)rp == (UnityEngine.Object)null) continue;
+				Transform rpT = ((Component)rp).transform;
+				for (int k = 0; k < rpT.childCount; k++)
+				{
+					Transform child = rpT.GetChild(k);
+					if ((UnityEngine.Object)(object)child == (UnityEngine.Object)null) continue;
+					string label = null;
+					string colorType = null;
+					int size = 1;
+					UsableObject uo = null;
+					uo = ((Component)child).GetComponent<UsableObject>();
+					if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null)
+						uo = ((Component)child).GetComponentInChildren<UsableObject>();
+					if ((UnityEngine.Object)(object)uo != (UnityEngine.Object)null)
+					{
+						size = (uo.sizeInU > 0) ? uo.sizeInU : 1;
+						label = DescribeUsableObject(uo);
+						if (label != null) colorType = ClassifyLabel(label);
+					}
+					else
+					{
+						Server srv = ((Component)child).GetComponentInChildren<Server>();
+						if ((UnityEngine.Object)(object)srv != (UnityEngine.Object)null)
+						{
+							uo = (UsableObject)(object)srv;
+							size = (((UsableObject)srv).sizeInU > 0) ? ((UsableObject)srv).sizeInU : 3;
+							label = srv.isBroken ? $"Server {size}U BROKEN" : (srv.isOn ? $"Server {size}U [ON]" : $"Server {size}U [OFF]");
+							colorType = "Server";
+						}
+						else
+						{
+							NetworkSwitch sw = ((Component)child).GetComponentInChildren<NetworkSwitch>();
+							if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null)
+							{
+								uo = (UsableObject)(object)sw;
+								size = 1;
+								label = sw.isBroken ? "Switch BROKEN" : (sw.isOn ? "Switch [ON]" : "Switch [OFF]");
+								colorType = "Switch";
+							}
+							else
+							{
+								PatchPanel pp = ((Component)child).GetComponentInChildren<PatchPanel>();
+								if ((UnityEngine.Object)(object)pp != (UnityEngine.Object)null)
+								{
+									size = 1;
+									label = "Patch Panel";
+									colorType = "PatchPanel";
+								}
+							}
+						}
+					}
+					if (label != null)
+					{
+						allServers.Add((rack, j, size, $"[{rackName}] {label}", colorType, uo));
+						for (int u = j; u < j + size && u < num; u++) slotsFound.Add(u);
+						break;
+					}
+				}
+			}
+		}
+
+		_bulkSelectedServerAnchors.Clear();
+		_bulkDragSelecting = false;
+
+		if (allServers.Count == 0)
+		{
+			AddLabel("  No installed items found in selected racks.");
+			AddClickableRow("  BACK TO OVERVIEW", new Color(0.3f, 0.3f, 0.3f), delegate { ShowRackList(); });
+			return;
+		}
+
+		AddColorLabel($"  {allServers.Count} item(s) across {_bulkSelectedRacks.Count} rack(s)", new Color(0.6f, 0.6f, 0.6f));
+		if (_bulkSelectedServerAnchors.Count > 0)
+		{
+			AddClickableRow($"  REMOVE SELECTED ({_bulkSelectedServerAnchors.Count})", new Color(0.55f, 0.15f, 0.15f), delegate
+			{
+				List<int> indices = _bulkSelectedServerAnchors.OrderByDescending((int x) => x).ToList();
+				foreach (int idx in indices)
+				{
+					if (idx < 0 || idx >= allServers.Count) continue;
+					Rack targetRack = allServers[idx].rack;
+					int targetAnchor = allServers[idx].anchor;
+					int targetSize = allServers[idx].size;
+					_selectedRack = targetRack;
+					RemoveItemByAnchor(targetAnchor, targetSize);
+				}
+				_bulkSelectedServerAnchors.Clear();
+				_bulkDragSelecting = false;
+				ShowBulkRackContents();
+			});
+			AddClickableRow("  CLEAR SELECTION", new Color(0.25f, 0.25f, 0.25f), delegate
+			{
+				_bulkSelectedServerAnchors.Clear();
+				_bulkDragSelecting = false;
+				ShowBulkRackContents();
+			});
+		}
+		AddSpacer();
+		AddColorLabel("  Hold Ctrl and click/drag items to select:", new Color(0.9f, 0.75f, 0.45f));
+		for (int i = 0; i < allServers.Count; i++)
+		{
+			int localIdx = i;
+			var (_, _, size, label, colorType, _) = allServers[i];
+			string rowText = $"    {label}  ({size}U)   [X]";
+			AddBulkSelectableServerRow(localIdx, size, rowText, GetColor(colorType));
+		}
+		AddSpacer();
+		AddClickableRow("  BACK TO OVERVIEW", new Color(0.3f, 0.3f, 0.3f), delegate
+		{
+			_bulkSelectedServerAnchors.Clear();
+			_bulkDragSelecting = false;
+			ShowRackList();
+		});
 	}
 
 	private void ShowRackDetail()
@@ -2751,7 +3604,8 @@ public class RackBuilderCore : MelonMod
 			foreach (var item4 in list)
 			{
 				var (anchor, size, _, _, _) = item4;
-				AddClickableRow($"    U{anchor + 1:D2}  |  {item4.Item3}  ({size}U)   [X]", GetColor(item4.Item4), delegate
+				string rowText = $"    U{anchor + 1:D2}  |  {item4.Item3}  ({size}U)   [X]";
+				AddClickableRow(rowText, GetColor(item4.Item4), delegate
 				{
 					RemoveItemByAnchor(anchor, size);
 					ShowRackDetail();
@@ -2770,8 +3624,7 @@ public class RackBuilderCore : MelonMod
 					int removed = RemoveAllItemsFromSelectedRack();
 					_pendingBulkClearConfirmation = false;
 					((MelonBase)this).LoggerInstance.Msg($"Bulk remove complete: removed {removed} installed items");
-					ShowRackDetail();
-					MelonCoroutines.Start(RefreshRackDetailDeferred(2));
+					MelonCoroutines.Start(RefreshRackDetailDeferred(1));
 				});
 				AddClickableRow("  NO - Cancel bulk remove", new Color(0.2f, 0.2f, 0.2f), delegate
 				{
@@ -2886,6 +3739,45 @@ public class RackBuilderCore : MelonMod
 			});
 		}
 		string selectedRackRole = GetRackRole(_selectedRack);
+		RackColorChoice selectedColor = GetSelectedRackColorChoice();
+		AddSpacer();
+		AddColorLabel("  Rack Color Picker", Color.white);
+		AddClickableRow($"  PRESET SEED - {selectedColor.Name}", selectedColor.Color * 0.75f, delegate
+		{
+			CycleRackColorChoice();
+			ShowRackDetail();
+		});
+		AddColorLabel($"  Current RGB: {Mathf.RoundToInt(_customRackColor.r * 255f)} / {Mathf.RoundToInt(_customRackColor.g * 255f)} / {Mathf.RoundToInt(_customRackColor.b * 255f)}", new Color(0.8f, 0.8f, 0.8f));
+		AddColorChannelRow("  Red", _customRackColor.r, delegate(float v)
+		{
+			_customRackColor.r = v;
+		});
+		AddColorChannelRow("  Green", _customRackColor.g, delegate(float v)
+		{
+			_customRackColor.g = v;
+		});
+		AddColorChannelRow("  Blue", _customRackColor.b, delegate(float v)
+		{
+			_customRackColor.b = v;
+		});
+		AddClickableRow("  APPLY CUSTOM COLOR TO THIS RACK", _customRackColor * 0.9f, delegate
+		{
+			bool changedColor = ApplyRackColor(_selectedRack, GetConfiguredRackColor());
+			if (changedColor)
+			{
+				EnsureRackColorsLoaded();
+				string key = BuildRackRoleKey(_selectedRack);
+				if (!string.IsNullOrEmpty(key))
+				{
+					_rackColorsByKey[key] = GetConfiguredRackColor();
+					SaveRackColors();
+				}
+				((MelonBase)this).LoggerInstance.Msg("Applied custom rack color");
+			}
+			else
+				((MelonBase)this).LoggerInstance.Warning("Could not apply color: no compatible material color properties found.");
+			ShowRackDetail();
+		});
 		AddSpacer();
 		AddColorLabel($"  Rack Role: {selectedRackRole.ToUpperInvariant()}", Color.white);
 		AddClickableRow($"  TOGGLE ROLE - Set as {(selectedRackRole == RackRoleNetwork ? "SERVER" : "NETWORK")} rack", new Color(0.2f, 0.25f, 0.4f), delegate
@@ -3691,6 +4583,10 @@ public class RackBuilderCore : MelonMod
 		Transform rackTransform = ((Component)_selectedRack).transform;
 		bool startRight = rackTransform.InverseTransformPoint(((Component)startPort).transform.position).x >= 0f;
 		bool endRight = rackTransform.InverseTransformPoint(((Component)endPort).transform.position).x >= 0f;
+		if ((UnityEngine.Object)(object)startPort.parentSwitch != (UnityEngine.Object)null || (UnityEngine.Object)(object)startPort.parentPatchPanel != (UnityEngine.Object)null)
+			startRight = false;
+		if ((UnityEngine.Object)(object)endPort.parentSwitch != (UnityEngine.Object)null || (UnityEngine.Object)(object)endPort.parentPatchPanel != (UnityEngine.Object)null)
+			endRight = false;
 		CableLink startClip = FindNearestClipOnSide(rackRailClips, ((Component)startPort).transform.position, startRight, rackTransform);
 		CableLink endClip = FindNearestClipOnSide(rackRailClips, ((Component)endPort).transform.position, endRight, rackTransform);
 		if ((UnityEngine.Object)(object)startClip != (UnityEngine.Object)null)
@@ -3701,6 +4597,27 @@ public class RackBuilderCore : MelonMod
 			CableLink endBridge = FindTopClipOnSide(rackRailClips, endRight, rackTransform);
 			if ((UnityEngine.Object)(object)startBridge != (UnityEngine.Object)null && !list.Contains(((Component)startBridge).transform))
 				list.Add(((Component)startBridge).transform);
+			// Route through overhead tray instead of directly over the rack top
+			List<CableLink> overheadClips = CollectOverheadClips();
+			if (overheadClips.Count > 0)
+			{
+				CableLink overheadAbove = null;
+				float bestOverheadSq = float.MaxValue;
+				Vector3 rackCenter = ((Component)_selectedRack).transform.position;
+				rackCenter.y = 3f;
+				foreach (CableLink oc in overheadClips)
+				{
+					if ((UnityEngine.Object)(object)oc == (UnityEngine.Object)null) continue;
+					float dSq = (((Component)oc).transform.position - rackCenter).sqrMagnitude;
+					if (dSq < bestOverheadSq)
+					{
+						bestOverheadSq = dSq;
+						overheadAbove = oc;
+					}
+				}
+				if ((UnityEngine.Object)(object)overheadAbove != (UnityEngine.Object)null)
+					list.Add(((Component)overheadAbove).transform);
+			}
 			if ((UnityEngine.Object)(object)endBridge != (UnityEngine.Object)null && !list.Contains(((Component)endBridge).transform))
 				list.Add(((Component)endBridge).transform);
 		}
@@ -3792,126 +4709,121 @@ public class RackBuilderCore : MelonMod
 
 	private List<Transform> BuildOverheadPath(Vector3 from, Vector3 to)
 	{
-		//IL_0047: Unknown result type (might be due to invalid IL or missing references)
-		//IL_004c: Unknown result type (might be due to invalid IL or missing references)
-		//IL_004d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0052: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00b0: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00b5: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00b6: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00bb: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0183: Unknown result type (might be due to invalid IL or missing references)
-		//IL_018e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0193: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0198: Unknown result type (might be due to invalid IL or missing references)
-		//IL_039c: Unknown result type (might be due to invalid IL or missing references)
-		//IL_03bc: Unknown result type (might be due to invalid IL or missing references)
-		//IL_03dc: Unknown result type (might be due to invalid IL or missing references)
-		//IL_03fc: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0201: Unknown result type (might be due to invalid IL or missing references)
-		//IL_020d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0212: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0217: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0229: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0234: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0239: Unknown result type (might be due to invalid IL or missing references)
-		//IL_023e: Unknown result type (might be due to invalid IL or missing references)
-		List<CableLink> list = CollectOverheadClips();
-		if (list.Count == 0)
-		{
+		List<CableLink> clips = CollectOverheadClips();
+		if (clips.Count == 0)
 			return new List<Transform>();
-		}
-		CableLink val = null;
-		float num = float.MaxValue;
-		Vector3 val2;
-		foreach (CableLink item in list)
+
+		CableLink startClip = null, endClip = null;
+		float bestStart = float.MaxValue, bestEnd = float.MaxValue;
+		foreach (CableLink c in clips)
 		{
-			val2 = ((Component)item).transform.position - from;
-			float sqrMagnitude = val2.sqrMagnitude;
-			if (sqrMagnitude < num)
+			if ((UnityEngine.Object)(object)c == (UnityEngine.Object)null) continue;
+			float dFrom = (((Component)c).transform.position - from).sqrMagnitude;
+			if (dFrom < bestStart) { bestStart = dFrom; startClip = c; }
+			float dTo = (((Component)c).transform.position - to).sqrMagnitude;
+			if (dTo < bestEnd) { bestEnd = dTo; endClip = c; }
+		}
+		if ((UnityEngine.Object)(object)startClip == (UnityEngine.Object)null || (UnityEngine.Object)(object)endClip == (UnityEngine.Object)null)
+			return new List<Transform>();
+		if ((UnityEngine.Object)(object)startClip == (UnityEngine.Object)(object)endClip)
+			return new List<Transform> { ((Component)startClip).transform };
+
+		Vector3 sPos = ((Component)startClip).transform.position;
+		Vector3 ePos = ((Component)endClip).transform.position;
+		Vector3 dir = ePos - sPos;
+		float totalLenSq = dir.sqrMagnitude;
+		dir.Normalize();
+
+		List<(CableLink clip, float proj, float perpSq)> candidates = new List<(CableLink, float, float)>();
+		foreach (CableLink c in clips)
+		{
+			if ((UnityEngine.Object)(object)c == (UnityEngine.Object)null || (UnityEngine.Object)(object)c == (UnityEngine.Object)(object)startClip || (UnityEngine.Object)(object)c == (UnityEngine.Object)(object)endClip)
+				continue;
+			Vector3 rel = ((Component)c).transform.position - sPos;
+			float proj = Vector3.Dot(rel, dir);
+			if (proj < 0f || proj * proj > totalLenSq) continue;
+			Vector3 ptOnLine = sPos + dir * proj;
+			float perpSq = (((Component)c).transform.position - ptOnLine).sqrMagnitude;
+			if (perpSq <= 16f)
+				candidates.Add((c, proj, perpSq));
+		}
+		candidates.Sort((a, b) => a.proj.CompareTo(b.proj));
+
+		List<Transform> result = new List<Transform>();
+		result.Add(((Component)startClip).transform);
+		Vector3 lastPos = sPos;
+		float minSpacingSq = 4f;
+		foreach (var (c, proj, perpSq) in candidates)
+		{
+			Vector3 p = ((Component)c).transform.position;
+			if ((p - lastPos).sqrMagnitude >= minSpacingSq)
 			{
-				num = sqrMagnitude;
-				val = item;
+				result.Add(((Component)c).transform);
+				lastPos = p;
 			}
 		}
-		CableLink val3 = null;
-		float num2 = float.MaxValue;
-		foreach (CableLink item2 in list)
+		Vector3 endP = ((Component)endClip).transform.position;
+		if ((lastPos - endP).sqrMagnitude > 0.01f)
+			result.Add(((Component)endClip).transform);
+
+		// Rack avoidance: if any segment passes near a rack, insert a detour waypoint
+		if (result.Count >= 2 && _allRacks.Count > 0)
 		{
-			val2 = ((Component)item2).transform.position - to;
-			float sqrMagnitude2 = val2.sqrMagnitude;
-			if (sqrMagnitude2 < num2)
+			List<Vector3> rackCenters = new List<Vector3>();
+			foreach (Rack rr in _allRacks)
 			{
-				num2 = sqrMagnitude2;
-				val3 = item2;
+				if ((UnityEngine.Object)(object)rr != (UnityEngine.Object)null)
+					rackCenters.Add(((Component)rr).transform.position);
 			}
-		}
-		if ((UnityEngine.Object)(object)val == (UnityEngine.Object)null || (UnityEngine.Object)(object)val3 == (UnityEngine.Object)null)
-		{
-			return new List<Transform>();
-		}
-		if ((UnityEngine.Object)(object)val == (UnityEngine.Object)(object)val3)
-		{
-			return new List<Transform> { ((Component)val).transform };
-		}
-		List<Transform> list2 = new List<Transform>();
-		HashSet<CableLink> hashSet = new HashSet<CableLink>();
-		CableLink val4 = val;
-		list2.Add(((Component)val4).transform);
-		hashSet.Add(val4);
-		int num3 = list.Count + 10;
-		while ((UnityEngine.Object)(object)val4 != (UnityEngine.Object)(object)val3 && num3-- > 0)
-		{
-			val2 = ((Component)val4).transform.position - ((Component)val3).transform.position;
-			float sqrMagnitude3 = val2.sqrMagnitude;
-			CableLink val5 = null;
-			float num4 = float.MaxValue;
-			CableLink val6 = null;
-			float num5 = float.MaxValue;
-			CableLink val7 = null;
-			float num6 = float.MaxValue;
-			foreach (CableLink item3 in list)
+			if (rackCenters.Count > 0)
 			{
-				if (!((UnityEngine.Object)(object)item3 == (UnityEngine.Object)null) && !hashSet.Contains(item3))
+				List<Transform> safePath = new List<Transform> { result[0] };
+				for (int ri = 1; ri < result.Count; ri++)
 				{
-					val2 = ((Component)item3).transform.position - ((Component)val4).transform.position;
-					float sqrMagnitude4 = val2.sqrMagnitude;
-					val2 = ((Component)item3).transform.position - ((Component)val3).transform.position;
-					float sqrMagnitude5 = val2.sqrMagnitude;
-					bool flag = sqrMagnitude5 < sqrMagnitude3;
-					bool flag2 = sqrMagnitude4 <= 16f;
-					if (flag2 && flag && sqrMagnitude4 < num4)
+					Vector3 p1 = result[ri - 1].position;
+					Vector3 p2 = result[ri].position;
+					Vector3 mid = (p1 + p2) * 0.5f;
+					bool blocked = false;
+					foreach (Vector3 rc in rackCenters)
 					{
-						num4 = sqrMagnitude4;
-						val5 = item3;
+						if (Mathf.Abs(mid.x - rc.x) < 0.6f && Mathf.Abs(mid.z - rc.z) < 0.8f)
+						{
+							blocked = true;
+							break;
+						}
 					}
-					if (flag2 && sqrMagnitude4 < num5)
+					if (blocked)
 					{
-						num5 = sqrMagnitude4;
-						val6 = item3;
+						CableLink detour = null;
+						float bestDsq = float.MaxValue;
+						Vector3 offsetDir = (mid - p1).normalized;
+						Vector3 perp = new Vector3(-offsetDir.z, 0f, offsetDir.x);
+						Vector3 detourPos = mid + perp * 0.8f;
+						foreach (CableLink cc in clips)
+						{
+							if ((UnityEngine.Object)(object)cc == (UnityEngine.Object)null) continue;
+							Vector3 cp = ((Component)cc).transform.position;
+							bool nearRack = false;
+							foreach (Vector3 rc in rackCenters)
+							{
+								if (Mathf.Abs(cp.x - rc.x) < 0.5f && Mathf.Abs(cp.z - rc.z) < 0.7f)
+								{ nearRack = true; break; }
+							}
+							if (nearRack) continue;
+							float d = (cp - detourPos).sqrMagnitude;
+							if (d < bestDsq) { bestDsq = d; detour = cc; }
+						}
+						if ((UnityEngine.Object)(object)detour != (UnityEngine.Object)null)
+							safePath.Add(((Component)detour).transform);
 					}
-					if (flag && sqrMagnitude4 < num6)
-					{
-						num6 = sqrMagnitude4;
-						val7 = item3;
-					}
+					safePath.Add(result[ri]);
 				}
+				result = safePath;
 			}
-			CableLink val8 = val5 ?? val6 ?? val7;
-			if ((UnityEngine.Object)(object)val8 == (UnityEngine.Object)null)
-			{
-				break;
-			}
-			list2.Add(((Component)val8).transform);
-			hashSet.Add(val8);
-			val4 = val8;
 		}
-		if ((UnityEngine.Object)(object)val4 != (UnityEngine.Object)(object)val3 && !hashSet.Contains(val3))
-		{
-			list2.Add(((Component)val3).transform);
-		}
-		((MelonBase)this).LoggerInstance.Msg($"BuildOverheadPath: {list2.Count} waypoints from ({from.x:F1},{from.z:F1}) to ({to.x:F1},{to.z:F1})");
-		return list2;
+
+		((MelonBase)this).LoggerInstance.Msg($"BuildOverheadPath: {result.Count} waypoints from ({from.x:F1},{from.z:F1}) to ({to.x:F1},{to.z:F1})");
+		return result;
 	}
 
 	private void AutoWireToCustomer(int targetBaseId)
@@ -4442,6 +5354,12 @@ public class RackBuilderCore : MelonMod
 			}
 			mount.isRackInstantiated = true;
 			Rack val3 = val2.GetComponent<Rack>() ?? val2.GetComponentInChildren<Rack>();
+			if ((UnityEngine.Object)(object)val3 != (UnityEngine.Object)null)
+			{
+				if (!TryGetSavedRackColor(val3, out Color savedColor))
+					savedColor = GetConfiguredRackColor();
+				ApplyRackColor(val3, savedColor);
+			}
 			MainGameManager val4 = GetMainGameManager();
 			if ((UnityEngine.Object)(object)val3 != (UnityEngine.Object)null && val3.positions != null && (UnityEngine.Object)(object)val4 != (UnityEngine.Object)null)
 			{
@@ -4734,7 +5652,23 @@ public class RackBuilderCore : MelonMod
 						catch
 						{
 						}
+						_autoWireProtectedCableIds.Remove(cableIDsOnLink);
 						val4.cableIDsOnLink = -1;
+					}
+				}
+			}
+			PatchPanel ppClean = ((Component)val2).GetComponent<PatchPanel>();
+			if ((UnityEngine.Object)(object)ppClean != (UnityEngine.Object)null && ppClean.cableLinkPorts != null)
+			{
+				foreach (CableLink ppPort in (Il2CppArrayBase<CableLink>)(object)ppClean.cableLinkPorts)
+				{
+					if ((UnityEngine.Object)(object)ppPort == (UnityEngine.Object)null) continue;
+					int ppCableId = ppPort.cableIDsOnLink;
+					if (ppCableId > 0)
+					{
+						try { val3.RemovePosition(ppCableId); } catch { }
+						_autoWireProtectedCableIds.Remove(ppCableId);
+						ppPort.cableIDsOnLink = -1;
 					}
 				}
 			}
@@ -4821,6 +5755,16 @@ public class RackBuilderCore : MelonMod
 			toRemove.Add((anchor, size));
 		}
 		toRemove.Sort((a, b) => b.anchor.CompareTo(a.anchor));
+		int switchCount = 0;
+		int serverCount = 0;
+		foreach (UsableObject uo in CollectRackUsableObjects(_selectedRack))
+		{
+			if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
+			if ((UnityEngine.Object)(object)((Component)uo).GetComponent<NetworkSwitch>() != (UnityEngine.Object)null)
+				switchCount++;
+			else if ((UnityEngine.Object)(object)((Component)uo).GetComponent<Server>() != (UnityEngine.Object)null)
+				serverCount++;
+		}
 		int removed = 0;
 		foreach ((int anchor, int size) entry in toRemove)
 		{
@@ -4834,6 +5778,14 @@ public class RackBuilderCore : MelonMod
 				((MelonBase)this).LoggerInstance.Warning($"Bulk remove skipped anchor U{entry.anchor + 1}: {ex.Message}");
 			}
 		}
+		SanitizeGhostCableIDs();
+		InvalidateRackSnapshot();
+		_cachedServersTime = -999f;
+		_cachedNetworkSwitchesTime = -999f;
+		_cachedPatchPanelsTime = -999f;
+		_cachedUsableObjectsTime = -999f;
+		SaveCableTopology();
+		((MelonBase)this).LoggerInstance.Msg($"[BulkRemove] post-cleanup: used0 installed0 switches0 — sanitized ghost cables, saved topology. Previously: {serverCount} servers, {switchCount} switches removed.");
 		return removed;
 	}
 
@@ -5181,6 +6133,179 @@ public class RackBuilderCore : MelonMod
 	{
 		//IL_0003: Unknown result type (might be due to invalid IL or missing references)
 		AddClickableRow(text, bgColor, onClick);
+	}
+
+	private void AddColorChannelRow(string channelName, float value, Action<float> onChanged)
+	{
+		GameObject row = CreateRow(30f);
+		Image bg = row.AddComponent<Image>();
+		((Graphic)bg).color = new Color(0.16f, 0.16f, 0.16f);
+		HorizontalLayoutGroup layout = row.AddComponent<HorizontalLayoutGroup>();
+		((HorizontalOrVerticalLayoutGroup)layout).spacing = 4f;
+		((HorizontalOrVerticalLayoutGroup)layout).childForceExpandWidth = false;
+		((HorizontalOrVerticalLayoutGroup)layout).childControlWidth = false;
+		RectOffset padding = new RectOffset();
+		padding.left = 8;
+		padding.right = 8;
+		((LayoutGroup)layout).padding = padding;
+
+		GameObject labelObj = new GameObject("Label");
+		labelObj.transform.SetParent(row.transform, false);
+		labelObj.AddComponent<RectTransform>();
+		LayoutElement labelLayout = labelObj.AddComponent<LayoutElement>();
+		labelLayout.preferredWidth = 96f;
+		TextMeshProUGUI label = labelObj.AddComponent<TextMeshProUGUI>();
+		((TMP_Text)label).text = channelName;
+		((TMP_Text)label).fontSize = 13f;
+		((TMP_Text)label).alignment = (TextAlignmentOptions)513;
+		((Graphic)label).color = Color.white;
+
+		GameObject minusObj = new GameObject("Minus");
+		minusObj.transform.SetParent(row.transform, false);
+		minusObj.AddComponent<RectTransform>();
+		LayoutElement minusLayout = minusObj.AddComponent<LayoutElement>();
+		minusLayout.preferredWidth = 28f;
+		Image minusBg = minusObj.AddComponent<Image>();
+		((Graphic)minusBg).color = new Color(0.28f, 0.18f, 0.18f);
+		Button minusButton = minusObj.AddComponent<Button>();
+		float currentValue = value;
+		((UnityEvent)minusButton.onClick).AddListener((Action)delegate
+		{
+			onChanged(Clamp01(currentValue - 0.05f));
+			ShowRackDetail();
+		});
+		TextMeshProUGUI minusText = new GameObject("T").AddComponent<TextMeshProUGUI>();
+		((TMP_Text)minusText).transform.SetParent(minusObj.transform, false);
+		((TMP_Text)minusText).text = "-";
+		((TMP_Text)minusText).fontSize = 16f;
+		((TMP_Text)minusText).alignment = (TextAlignmentOptions)514;
+		((Graphic)minusText).color = Color.white;
+		RectTransform minusRect = ((Component)minusText).GetComponent<RectTransform>();
+		minusRect.anchorMin = Vector2.zero;
+		minusRect.anchorMax = Vector2.one;
+		minusRect.sizeDelta = Vector2.zero;
+
+		GameObject valueObj = new GameObject("Value");
+		valueObj.transform.SetParent(row.transform, false);
+		valueObj.AddComponent<RectTransform>();
+		LayoutElement valueLayout = valueObj.AddComponent<LayoutElement>();
+		valueLayout.preferredWidth = 54f;
+		TextMeshProUGUI valueText = valueObj.AddComponent<TextMeshProUGUI>();
+		((TMP_Text)valueText).text = Mathf.RoundToInt(value * 255f).ToString();
+		((TMP_Text)valueText).fontSize = 13f;
+		((TMP_Text)valueText).alignment = (TextAlignmentOptions)514;
+		((Graphic)valueText).color = new Color(0.85f, 0.85f, 0.85f);
+
+		GameObject plusObj = new GameObject("Plus");
+		plusObj.transform.SetParent(row.transform, false);
+		plusObj.AddComponent<RectTransform>();
+		LayoutElement plusLayout = plusObj.AddComponent<LayoutElement>();
+		plusLayout.preferredWidth = 28f;
+		Image plusBg = plusObj.AddComponent<Image>();
+		((Graphic)plusBg).color = new Color(0.18f, 0.28f, 0.18f);
+		Button plusButton = plusObj.AddComponent<Button>();
+		((UnityEvent)plusButton.onClick).AddListener((Action)delegate
+		{
+			onChanged(Clamp01(currentValue + 0.05f));
+			ShowRackDetail();
+		});
+		TextMeshProUGUI plusText = new GameObject("T").AddComponent<TextMeshProUGUI>();
+		((TMP_Text)plusText).transform.SetParent(plusObj.transform, false);
+		((TMP_Text)plusText).text = "+";
+		((TMP_Text)plusText).fontSize = 16f;
+		((TMP_Text)plusText).alignment = (TextAlignmentOptions)514;
+		((Graphic)plusText).color = Color.white;
+		RectTransform plusRect = ((Component)plusText).GetComponent<RectTransform>();
+		plusRect.anchorMin = Vector2.zero;
+		plusRect.anchorMax = Vector2.one;
+		plusRect.sizeDelta = Vector2.zero;
+	}
+
+	private void AddBulkSelectableServerRow(int anchor, int size, string text, Color baseColor)
+	{
+		GameObject row = CreateRow(32f);
+		Image bg = row.AddComponent<Image>();
+		bool isSelected = _bulkSelectedServerAnchors.Contains(anchor);
+		Color selectedColor = new Color(0.65f, 0.35f, 0.12f);
+		((Graphic)bg).color = isSelected ? selectedColor : baseColor;
+		Button button = row.AddComponent<Button>();
+		ColorBlock colors = ((Selectable)button).colors;
+		colors.highlightedColor = GetHoverColor(isSelected ? selectedColor : baseColor);
+		((Selectable)button).colors = colors;
+
+		GameObject textObj = new GameObject("Text");
+		textObj.transform.SetParent(row.transform, false);
+		RectTransform textRect = textObj.AddComponent<RectTransform>();
+		textRect.anchorMin = Vector2.zero;
+		textRect.anchorMax = Vector2.one;
+		textRect.sizeDelta = Vector2.zero;
+		TextMeshProUGUI label = textObj.AddComponent<TextMeshProUGUI>();
+		((TMP_Text)label).text = text;
+		((TMP_Text)label).fontSize = 14f;
+		((TMP_Text)label).alignment = (TextAlignmentOptions)513;
+		((Graphic)label).color = Color.white;
+		((TMP_Text)label).enableWordWrapping = false;
+
+		int localAnchor = anchor;
+		Action applyVisual = delegate
+		{
+			bool nowSelected = _bulkSelectedServerAnchors.Contains(localAnchor);
+			((Graphic)bg).color = nowSelected ? selectedColor : baseColor;
+			ColorBlock cb = ((Selectable)button).colors;
+			cb.highlightedColor = GetHoverColor(nowSelected ? selectedColor : baseColor);
+			((Selectable)button).colors = cb;
+		};
+
+		((UnityEvent)button.onClick).AddListener((Action)delegate
+		{
+			if (!_bulkEditMode || !IsCtrlHeld())
+				return;
+			bool targetState = !_bulkSelectedServerAnchors.Contains(localAnchor);
+			SetBulkServerSelection(localAnchor, targetState);
+			applyVisual();
+		});
+
+		EventTrigger trigger = row.AddComponent<EventTrigger>();
+
+		EventTrigger.Entry downEntry = new EventTrigger.Entry();
+		downEntry.eventID = EventTriggerType.PointerDown;
+		((UnityEvent<BaseEventData>)(object)downEntry.callback).AddListener((Action<BaseEventData>)delegate
+		{
+			if (!_bulkEditMode || !IsCtrlHeld())
+				return;
+			_bulkDragSelecting = true;
+			_bulkDragTargetSelectState = !_bulkSelectedServerAnchors.Contains(localAnchor);
+			SetBulkServerSelection(localAnchor, _bulkDragTargetSelectState);
+			applyVisual();
+		});
+		trigger.triggers.Add(downEntry);
+
+		EventTrigger.Entry enterEntry = new EventTrigger.Entry();
+		enterEntry.eventID = EventTriggerType.PointerEnter;
+		((UnityEvent<BaseEventData>)(object)enterEntry.callback).AddListener((Action<BaseEventData>)delegate
+		{
+			if (!_bulkEditMode || !_bulkDragSelecting || !IsCtrlHeld())
+				return;
+			SetBulkServerSelection(localAnchor, _bulkDragTargetSelectState);
+			applyVisual();
+		});
+		trigger.triggers.Add(enterEntry);
+
+		EventTrigger.Entry upEntry = new EventTrigger.Entry();
+		upEntry.eventID = EventTriggerType.PointerUp;
+		((UnityEvent<BaseEventData>)(object)upEntry.callback).AddListener((Action<BaseEventData>)delegate
+		{
+			_bulkDragSelecting = false;
+		});
+		trigger.triggers.Add(upEntry);
+
+		EventTrigger.Entry endDragEntry = new EventTrigger.Entry();
+		endDragEntry.eventID = EventTriggerType.EndDrag;
+		((UnityEvent<BaseEventData>)(object)endDragEntry.callback).AddListener((Action<BaseEventData>)delegate
+		{
+			_bulkDragSelecting = false;
+		});
+		trigger.triggers.Add(endDragEntry);
 	}
 
 	private void AddQuantityRow(string itemName, int sizeInU, Color bgColor, int choiceIdx, int freeU)
