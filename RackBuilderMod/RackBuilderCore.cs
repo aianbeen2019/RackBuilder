@@ -25,6 +25,19 @@ public class RackBuilderCore : MelonMod
 
 	private static RackBuilderCore _instance;
 
+	private readonly struct RackColorChoice
+	{
+		public readonly string Name;
+
+		public readonly Color Color;
+
+		public RackColorChoice(string name, Color color)
+		{
+			Name = name;
+			Color = color;
+		}
+	}
+
 	public struct ItemChoice
 	{
 		public string name;
@@ -98,6 +111,29 @@ public class RackBuilderCore : MelonMod
 	}
 
 	[Serializable]
+	public class RackColorEntry
+	{
+		[JsonPropertyName("rackKey")]
+		public string RackKey { get; set; }
+
+		[JsonPropertyName("colorR")]
+		public float ColorR { get; set; }
+
+		[JsonPropertyName("colorG")]
+		public float ColorG { get; set; }
+
+		[JsonPropertyName("colorB")]
+		public float ColorB { get; set; }
+	}
+
+	[Serializable]
+	public class RackColorData
+	{
+		[JsonPropertyName("racks")]
+		public List<RackColorEntry> Racks { get; set; } = new List<RackColorEntry>();
+	}
+
+	[Serializable]
 	public class RackProfileItemEntry
 	{
 		[JsonPropertyName("category")]
@@ -143,6 +179,7 @@ public class RackBuilderCore : MelonMod
 	private bool _integrated;
 	private bool _startupCableRestoreQueued;
 	private bool _startupCableRestoreInFlight;
+	private bool _startupRackColorsRestored;
 	private int _nextStartupRestoreCheckFrame;
 	private int _nextStartupTopologyCheckFrame;
 	private int _nextPerformanceHeartbeatFrame;
@@ -266,6 +303,50 @@ public class RackBuilderCore : MelonMod
 	private bool _rackRolesLoaded;
 
 	private Dictionary<string, string> _rackRolesByKey = new Dictionary<string, string>();
+
+	private bool _rackColorsLoaded;
+
+	private readonly Dictionary<string, Color> _rackColorsByKey = new Dictionary<string, Color>();
+
+	private bool _inputSystemHotkeyWarningLogged;
+
+	private readonly RackColorChoice[] _rackColorChoices = new RackColorChoice[]
+	{
+		new RackColorChoice("Graphite", new Color(0.18f, 0.2f, 0.23f)),
+		new RackColorChoice("Arctic", new Color(0.75f, 0.79f, 0.85f)),
+		new RackColorChoice("Ocean", new Color(0.18f, 0.38f, 0.62f)),
+		new RackColorChoice("Forest", new Color(0.2f, 0.42f, 0.28f)),
+		new RackColorChoice("Amber", new Color(0.62f, 0.43f, 0.18f)),
+		new RackColorChoice("Crimson", new Color(0.54f, 0.2f, 0.22f))
+	};
+
+	private readonly RackColorChoice[] _cableColors = new RackColorChoice[]
+	{
+		new RackColorChoice("Black", new Color(0.12f, 0.12f, 0.12f)),
+		new RackColorChoice("Blue", new Color(0.2f, 0.4f, 0.8f)),
+		new RackColorChoice("Red", new Color(0.7f, 0.15f, 0.15f)),
+		new RackColorChoice("Green", new Color(0.15f, 0.6f, 0.2f)),
+		new RackColorChoice("Yellow", new Color(0.8f, 0.7f, 0.1f)),
+		new RackColorChoice("Orange", new Color(0.8f, 0.4f, 0.05f)),
+		new RackColorChoice("Purple", new Color(0.55f, 0.15f, 0.6f)),
+		new RackColorChoice("White", new Color(0.85f, 0.85f, 0.85f))
+	};
+
+	private int _selectedRackColorIndex;
+
+	private Color _customRackColor = new Color(0.18f, 0.2f, 0.23f);
+
+	private bool _bulkEditMode;
+
+	private int _cableColorIndex;
+
+	private bool _bulkDragSelecting;
+
+	private bool _bulkDragTargetSelectState;
+
+	private readonly HashSet<int> _bulkSelectedServerAnchors = new HashSet<int>();
+
+	private readonly HashSet<Rack> _bulkSelectedRacks = new HashSet<Rack>();
 
 	private bool _rackProfilesLoaded;
 
@@ -418,10 +499,22 @@ public class RackBuilderCore : MelonMod
 		_switchTypeSpeedMap.Clear();
 		_autoWireProtectedCableIds.Clear();
 		_pendingRemovalUsableIds.Clear();
+		_bulkSelectedServerAnchors.Clear();
+		_bulkSelectedRacks.Clear();
 		_suppressUiUpdates = false;
 		_batchAutoWireInProgress = false;
+		_bulkDragSelecting = false;
+		_bulkDragTargetSelectState = false;
+		_bulkEditMode = false;
+		_cableColorIndex = 0;
+		_selectedRackColorIndex = 0;
+		_customRackColor = new Color(0.18f, 0.2f, 0.23f);
+		_rackColorsLoaded = false;
+		_rackColorsByKey.Clear();
+		_inputSystemHotkeyWarningLogged = false;
 		_startupCableRestoreQueued = false;
 		_startupCableRestoreInFlight = false;
+		_startupRackColorsRestored = false;
 		_nextStartupRestoreCheckFrame = 0;
 		_nextStartupTopologyCheckFrame = 0;
 		_cachedCablePositions = null;
@@ -502,6 +595,26 @@ public class RackBuilderCore : MelonMod
 		TryQueueStartupCableRestore();
 		long restoreMs = (long)((Time.realtimeSinceStartup - restoreStart) * 1000f);
 		LogPerformanceEvent("[OnUpdate] TryQueueStartupCableRestore", restoreMs, $" (frame={Time.frameCount})");
+		if (_integrated && (UnityEngine.Object)(object)_rackScreen != (UnityEngine.Object)null && IsRackManagerTogglePressed())
+		{
+			if (_rackScreen.activeSelf)
+			{
+				_rackScreen.SetActive(false);
+				_onDetailPage = false;
+				_selectedRack = null;
+				_pendingBulkClearConfirmation = false;
+				if ((UnityEngine.Object)(object)_shop != (UnityEngine.Object)null && (UnityEngine.Object)(object)_shop.mainScreen != (UnityEngine.Object)null)
+					_shop.mainScreen.SetActive(true);
+			}
+			else if ((UnityEngine.Object)(object)_shop != (UnityEngine.Object)null)
+			{
+				_shop.mainScreen.SetActive(false);
+				_rackScreen.SetActive(true);
+				_onDetailPage = false;
+				BuildItemChoices();
+				ShowRackList();
+			}
+		}
 		long overallMs = (long)((Time.realtimeSinceStartup - overallStart) * 1000f);
 		if (_enableVerboseDiagnostics && (overallMs >= SlowUpdateThresholdMs || Time.frameCount >= _nextPerformanceHeartbeatFrame))
 		{
@@ -527,6 +640,13 @@ public class RackBuilderCore : MelonMod
 			return;
 		if (GetRackSnapshot().Count == 0)
 			return;
+
+		if (!_startupRackColorsRestored)
+		{
+			PreWarmCableClips();
+			RestoreSavedRackColors();
+			_startupRackColorsRestored = true;
+		}
 
 		if (frame < _nextStartupTopologyCheckFrame)
 			return;
@@ -1092,6 +1212,11 @@ public class RackBuilderCore : MelonMod
 		return Path.Combine(UnityEngine.Application.persistentDataPath, "RackRoles.json");
 	}
 
+	private static string GetRackColorsFilePath()
+	{
+		return Path.Combine(UnityEngine.Application.persistentDataPath, "RackColors.json");
+	}
+
 	private static string GetRackProfilesFilePath()
 	{
 		return Path.Combine(UnityEngine.Application.persistentDataPath, "RackProfiles.json");
@@ -1314,6 +1439,306 @@ public class RackBuilderCore : MelonMod
 		{
 			((MelonBase)this).LoggerInstance.Warning("Failed to save rack roles: " + ex.Message);
 		}
+	}
+
+	private void EnsureRackColorsLoaded()
+	{
+		if (_rackColorsLoaded)
+			return;
+		_rackColorsLoaded = true;
+		_rackColorsByKey.Clear();
+		try
+		{
+			string path = GetRackColorsFilePath();
+			if (!File.Exists(path))
+				return;
+			string json = File.ReadAllText(path);
+			RackColorData data = JsonSerializer.Deserialize<RackColorData>(json);
+			if (data?.Racks == null)
+				return;
+			foreach (RackColorEntry entry in data.Racks)
+			{
+				if (entry == null || string.IsNullOrEmpty(entry.RackKey))
+					continue;
+				_rackColorsByKey[entry.RackKey] = new Color(entry.ColorR, entry.ColorG, entry.ColorB);
+			}
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Failed to load rack colors: " + ex.Message);
+		}
+	}
+
+	private void SaveRackColors()
+	{
+		try
+		{
+			RackColorData data = new RackColorData();
+			foreach (KeyValuePair<string, Color> kv in _rackColorsByKey)
+			{
+				data.Racks.Add(new RackColorEntry
+				{
+					RackKey = kv.Key,
+					ColorR = kv.Value.r,
+					ColorG = kv.Value.g,
+					ColorB = kv.Value.b
+				});
+			}
+			string json = JsonSerializer.Serialize(data, IndentedJsonOptions);
+			File.WriteAllText(GetRackColorsFilePath(), json);
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Failed to save rack colors: " + ex.Message);
+		}
+	}
+
+	private bool TryGetSavedRackColor(Rack rack, out Color color)
+	{
+		color = Color.white;
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+			return false;
+		EnsureRackColorsLoaded();
+		string key = BuildRackRoleKey(rack);
+		if (string.IsNullOrEmpty(key))
+			return false;
+		return _rackColorsByKey.TryGetValue(key, out color);
+	}
+
+	private RackColorChoice GetSelectedRackColorChoice()
+	{
+		if (_rackColorChoices.Length == 0)
+			return new RackColorChoice("Default", new Color(0.18f, 0.2f, 0.23f));
+		if (_selectedRackColorIndex < 0 || _selectedRackColorIndex >= _rackColorChoices.Length)
+			_selectedRackColorIndex = 0;
+		return _rackColorChoices[_selectedRackColorIndex];
+	}
+
+	private Color GetConfiguredRackColor()
+	{
+		return _customRackColor;
+	}
+
+	private void CycleRackColorChoice()
+	{
+		if (_rackColorChoices.Length == 0)
+			return;
+		_selectedRackColorIndex++;
+		if (_selectedRackColorIndex >= _rackColorChoices.Length)
+			_selectedRackColorIndex = 0;
+		_customRackColor = _rackColorChoices[_selectedRackColorIndex].Color;
+	}
+
+	private RackColorChoice GetSelectedCableColor()
+	{
+		if (_cableColors.Length == 0)
+			return new RackColorChoice("Blue", new Color(0.2f, 0.4f, 0.8f));
+		if (_cableColorIndex < 0 || _cableColorIndex >= _cableColors.Length)
+			_cableColorIndex = 0;
+		return _cableColors[_cableColorIndex];
+	}
+
+	private void CycleCableColorChoice()
+	{
+		if (_cableColors.Length == 0)
+			return;
+		_cableColorIndex++;
+		if (_cableColorIndex >= _cableColors.Length)
+			_cableColorIndex = 0;
+	}
+
+	private static float Clamp01(float value)
+	{
+		if (value < 0f)
+			return 0f;
+		if (value > 1f)
+			return 1f;
+		return value;
+	}
+
+	private static Color GetReadableTextColor(Color bg)
+	{
+		float luminance = 0.2126f * bg.r + 0.7152f * bg.g + 0.0722f * bg.b;
+		return (luminance > 0.58f) ? new Color(0.1f, 0.1f, 0.1f) : new Color(0.95f, 0.95f, 0.95f);
+	}
+
+	private static Color GetHoverColor(Color baseColor)
+	{
+		return new Color(
+			Clamp01(baseColor.r + 0.12f),
+			Clamp01(baseColor.g + 0.12f),
+			Clamp01(baseColor.b + 0.12f),
+			1f);
+	}
+
+	private bool TryGetRackColor(Rack rack, out Color color)
+	{
+		color = Color.white;
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+			return false;
+		Il2CppArrayBase<Renderer> renderers = ((Component)rack).GetComponentsInChildren<Renderer>(true);
+		if (renderers == null)
+			return false;
+		foreach (Renderer renderer in renderers)
+		{
+			if ((UnityEngine.Object)(object)renderer == (UnityEngine.Object)null)
+				continue;
+			Material[] mats = renderer.materials;
+			if (mats == null)
+				continue;
+			foreach (Material mat in mats)
+			{
+				if ((UnityEngine.Object)(object)mat == (UnityEngine.Object)null)
+					continue;
+				if (mat.HasProperty("_BaseColor"))
+				{
+					color = mat.GetColor("_BaseColor");
+					return true;
+				}
+				if (mat.HasProperty("_Color"))
+				{
+					color = mat.GetColor("_Color");
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private Color GetRackPreviewColor(Rack rack)
+	{
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+			return new Color(0.15f, 0.4f, 0.15f);
+		if (!_rackColorsLoaded)
+			EnsureRackColorsLoaded();
+		if (_rackColorsByKey.Count > 0)
+		{
+			string key = BuildRackRoleKey(rack);
+			if (!string.IsNullOrEmpty(key) && _rackColorsByKey.TryGetValue(key, out Color savedColor))
+				return savedColor;
+		}
+		if (TryGetRackColor(rack, out Color liveColor))
+			return liveColor;
+		return new Color(0.15f, 0.4f, 0.15f);
+	}
+
+	private bool IsCtrlHeld()
+	{
+		return Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
+	}
+
+	private bool IsRackManagerTogglePressed()
+	{
+		try
+		{
+			if (!Input.GetKeyDown(KeyCode.R))
+				return false;
+			if (EventSystem.current == null)
+				return true;
+			GameObject selected = EventSystem.current.currentSelectedGameObject;
+			if ((UnityEngine.Object)(object)selected == (UnityEngine.Object)null)
+				return true;
+			if (selected.GetComponentInParent<InputField>() != null)
+				return false;
+			if (selected.GetComponentInParent<TMP_InputField>() != null)
+				return false;
+			return true;
+		}
+		catch (Exception ex)
+		{
+			if (!_inputSystemHotkeyWarningLogged)
+			{
+				_inputSystemHotkeyWarningLogged = true;
+				((MelonBase)this).LoggerInstance.Warning("Rack Manager hotkey polling failed once: " + ex.Message + " (Rack Manager remains available via laptop UI button).");
+			}
+			return false;
+		}
+	}
+
+	private void SetBulkServerSelection(int anchor, bool selected)
+	{
+		if (selected)
+			_bulkSelectedServerAnchors.Add(anchor);
+		else
+			_bulkSelectedServerAnchors.Remove(anchor);
+	}
+
+	private bool ApplyRackColor(Rack rack, Color color)
+	{
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+			return false;
+		bool changed = false;
+		Il2CppArrayBase<Renderer> renderers = ((Component)rack).GetComponentsInChildren<Renderer>(true);
+		if (renderers == null)
+			return false;
+		foreach (Renderer renderer in renderers)
+		{
+			if ((UnityEngine.Object)(object)renderer == (UnityEngine.Object)null)
+				continue;
+			if (renderer.GetComponentInParent<UsableObject>() != null)
+				continue;
+			Material[] mats = renderer.materials;
+			if (mats == null)
+				continue;
+			foreach (Material mat in mats)
+			{
+				if ((UnityEngine.Object)(object)mat == (UnityEngine.Object)null)
+					continue;
+				if (mat.renderQueue >= 3000)
+					continue;
+				bool materialChanged = false;
+				if (mat.HasProperty("_BaseColor"))
+				{
+					mat.SetColor("_BaseColor", color);
+					materialChanged = true;
+				}
+				if (mat.HasProperty("_Color"))
+				{
+					mat.SetColor("_Color", color);
+					materialChanged = true;
+				}
+				if (materialChanged)
+					changed = true;
+			}
+		}
+		return changed;
+	}
+
+	private void RestoreSavedRackColors()
+	{
+		EnsureRackColorsLoaded();
+		if (_rackColorsByKey.Count == 0)
+			return;
+		int restored = 0;
+		foreach (Rack rack in GetRackSnapshot())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+				continue;
+			string key = BuildRackRoleKey(rack);
+			if (string.IsNullOrEmpty(key))
+				continue;
+			if (!_rackColorsByKey.TryGetValue(key, out Color saved))
+				continue;
+			if (ApplyRackColor(rack, saved))
+				restored++;
+		}
+		if (restored > 0)
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Restored rack colors for {restored} racks");
+	}
+
+	private void PreWarmCableClips()
+	{
+		if (_cachedOverheadClips != null)
+			return;
+		List<CableLink> clips = new List<CableLink>();
+		foreach (CableLink cl in UnityEngine.Object.FindObjectsOfType<CableLink>(true))
+		{
+			if ((UnityEngine.Object)(object)cl == (UnityEngine.Object)null)
+				continue;
+			if (((UnityEngine.Object)cl).name.Contains("Clip") && ((UnityEngine.Object)((Component)cl).gameObject).name.Contains("Clip"))
+				clips.Add(cl);
+		}
+		_cachedOverheadClips = clips;
 	}
 
 	private void EnsureRackProfilesLoaded()
@@ -3192,6 +3617,63 @@ public class RackBuilderCore : MelonMod
 			return;
 		}
 		AddTitle("Data Center Floor Plan");
+		RackColorChoice rackColor = GetSelectedRackColorChoice();
+		AddClickableRow($"  Rack Color: {rackColor.Name}  (click to cycle)", rackColor.Color * 0.75f, delegate
+		{
+			CycleRackColorChoice();
+			ShowRackList();
+		});
+		AddColorLabel("  New racks will use the selected color", new Color(0.7f, 0.7f, 0.7f));
+		AddClickableRow($"  BULK EDIT MODE: {(_bulkEditMode ? "ON" : "OFF")}", _bulkEditMode ? new Color(0.48f, 0.25f, 0.1f) : new Color(0.2f, 0.2f, 0.2f), delegate
+		{
+			_bulkEditMode = !_bulkEditMode;
+			_bulkDragSelecting = false;
+			if (!_bulkEditMode)
+				_bulkSelectedRacks.Clear();
+			ShowRackList();
+		});
+		RackColorChoice cableColor = GetSelectedCableColor();
+		AddClickableRow($"  Cable Color: {cableColor.Name}", cableColor.Color * 0.75f, delegate
+		{
+			CycleCableColorChoice();
+			ShowRackList();
+		});
+		AddColorLabel("  Color used for new cables", new Color(0.7f, 0.7f, 0.7f));
+		if (_bulkEditMode)
+		{
+			AddSpacer();
+			AddColorLabel("  Bulk: Hold Ctrl and drag over racks to select multiple", new Color(0.9f, 0.75f, 0.45f));
+			if (_bulkSelectedRacks.Count > 0)
+			{
+				AddColorLabel($"  {_bulkSelectedRacks.Count} rack(s) selected", new Color(0.9f, 0.75f, 0.45f));
+				AddClickableRow("  EDIT ALL RACK-CONTENTS", new Color(0.35f, 0.5f, 0.7f), delegate
+				{
+					ShowBulkRackContents();
+				});
+				AddClickableRow($"  REMOVE ALL EQUIPMENT ({_bulkSelectedRacks.Count} racks)", new Color(0.55f, 0.15f, 0.15f), delegate
+				{
+					BulkRemoveAllEquipment();
+				});
+				AddClickableRow($"  SET RACK COLOR ({_bulkSelectedRacks.Count} racks)", new Color(0.4f, 0.3f, 0.6f), delegate
+				{
+					BulkSetRackColor();
+				});
+				AddClickableRow("  MERGE SELECTED RACKS", new Color(0.25f, 0.45f, 0.35f), delegate
+				{
+					BulkOpenSelectedRacks();
+				});
+				AddClickableRow($"  REMOVE SELECTED RACKS ({_bulkSelectedRacks.Count} racks)", new Color(0.55f, 0.1f, 0.1f), delegate
+				{
+					BulkRemoveSelectedRacks();
+				});
+				AddClickableRow("  CLEAR SELECTION", new Color(0.25f, 0.25f, 0.25f), delegate
+				{
+					_bulkSelectedRacks.Clear();
+					ShowRackList();
+				});
+			}
+		}
+		AddSpacer();
 		int num = 0;
 		foreach (Wall item2 in GetWallSnapshot())
 		{
@@ -3300,7 +3782,7 @@ public class RackBuilderCore : MelonMod
 			long key = ((long)num5 << 32) | (uint)num6;
 			dictionary[key] = item6;
 		}
-		AddLabel($"  {_allRacks.Count} racks  |  Grey=empty  Green=installed  |  Click to manage");
+		AddLabel($"  {_allRacks.Count} racks  |  Grey=empty  Installed=rack color  |  Click to manage");
 		AddSpacer();
 		foreach (int item7 in list4)
 		{
@@ -3345,8 +3827,9 @@ public class RackBuilderCore : MelonMod
 					}
 					if (flag)
 					{
-						((Graphic)val10).color = new Color(0.15f, 0.4f, 0.15f);
-						colors.highlightedColor = new Color(0.25f, 0.55f, 0.25f);
+						Color rackPreviewColor = GetRackPreviewColor(componentInChildren);
+						((Graphic)val10).color = rackPreviewColor;
+						colors.highlightedColor = GetHoverColor(rackPreviewColor);
 						GameObject val12 = new GameObject("Util");
 						val12.transform.SetParent(val9.transform, false);
 						RectTransform val13 = val12.AddComponent<RectTransform>();
@@ -3358,19 +3841,36 @@ public class RackBuilderCore : MelonMod
 						((TMP_Text)val14).fontSize = 8f;
 						((TMP_Text)val14).alignment = (TextAlignmentOptions)514;
 						((TMP_Text)val14).enableWordWrapping = false;
-						((Graphic)val14).color = new Color(0.9f, 1f, 0.9f);
+						((Graphic)val14).color = GetReadableTextColor(rackPreviewColor);
 						((Graphic)val14).raycastTarget = false;
 						Rack r = componentInChildren;
 						RackMount m = value;
+						Image cellImage = val10;
+						Color originalRackColor = rackPreviewColor;
+						Color selectedRackColor = new Color(0.65f, 0.35f, 0.12f);
+						if (_bulkSelectedRacks.Contains(r))
+							((Graphic)cellImage).color = selectedRackColor;
 						((UnityEvent)val11.onClick).AddListener((Action)delegate
 						{
-							if ((UnityEngine.Object)(object)r != (UnityEngine.Object)null)
+							if ((UnityEngine.Object)(object)r == (UnityEngine.Object)null)
+								return;
+							if (_bulkEditMode && IsCtrlHeld())
 							{
-								_selectedRack = r;
-								_pendingBulkClearConfirmation = false;
-								_onDetailPage = true;
-								ShowRackDetail();
+								bool targetState = !_bulkSelectedRacks.Contains(r);
+								if (targetState)
+									_bulkSelectedRacks.Add(r);
+								else
+									_bulkSelectedRacks.Remove(r);
+								((Graphic)cellImage).color = targetState ? selectedRackColor : originalRackColor;
+								ShowRackList();
+								return;
 							}
+							_selectedRack = r;
+							_pendingBulkClearConfirmation = false;
+							_bulkDragSelecting = false;
+							_bulkSelectedServerAnchors.Clear();
+							_onDetailPage = true;
+							ShowRackDetail();
 						});
 						EventTrigger val15 = val9.AddComponent<EventTrigger>();
 						EventTrigger.Entry val16 = new EventTrigger.Entry();
@@ -3387,6 +3887,60 @@ public class RackBuilderCore : MelonMod
 							}
 						});
 						val15.triggers.Add(val16);
+						if (_bulkEditMode)
+						{
+							EventTrigger.Entry downEntry = new EventTrigger.Entry();
+							downEntry.eventID = EventTriggerType.PointerDown;
+							((UnityEvent<BaseEventData>)(object)downEntry.callback).AddListener((Action<BaseEventData>)delegate(BaseEventData data)
+							{
+								if (!IsCtrlHeld())
+									return;
+								PointerEventData ped = ((Il2CppObjectBase)data).TryCast<PointerEventData>();
+								if (ped != null && (int)ped.button != 0)
+									return;
+								_bulkDragSelecting = true;
+								_bulkDragTargetSelectState = !_bulkSelectedRacks.Contains(r);
+								if (_bulkDragTargetSelectState)
+									_bulkSelectedRacks.Add(r);
+								else
+									_bulkSelectedRacks.Remove(r);
+								((Graphic)cellImage).color = _bulkSelectedRacks.Contains(r) ? selectedRackColor : originalRackColor;
+							});
+							val15.triggers.Add(downEntry);
+							EventTrigger.Entry enterEntry = new EventTrigger.Entry();
+							enterEntry.eventID = EventTriggerType.PointerEnter;
+							((UnityEvent<BaseEventData>)(object)enterEntry.callback).AddListener((Action<BaseEventData>)delegate
+							{
+								if (!_bulkDragSelecting || !IsCtrlHeld())
+									return;
+								if (_bulkDragTargetSelectState)
+									_bulkSelectedRacks.Add(r);
+								else
+									_bulkSelectedRacks.Remove(r);
+								((Graphic)cellImage).color = _bulkSelectedRacks.Contains(r) ? selectedRackColor : originalRackColor;
+							});
+							val15.triggers.Add(enterEntry);
+							EventTrigger.Entry upEntry = new EventTrigger.Entry();
+							upEntry.eventID = EventTriggerType.PointerUp;
+							((UnityEvent<BaseEventData>)(object)upEntry.callback).AddListener((Action<BaseEventData>)delegate
+							{
+								bool wasDragging = _bulkDragSelecting;
+								_bulkDragSelecting = false;
+								if (wasDragging && !_onDetailPage)
+									ShowRackList();
+							});
+							val15.triggers.Add(upEntry);
+							EventTrigger.Entry endDragEntry = new EventTrigger.Entry();
+							endDragEntry.eventID = EventTriggerType.EndDrag;
+							((UnityEvent<BaseEventData>)(object)endDragEntry.callback).AddListener((Action<BaseEventData>)delegate
+							{
+								bool wasDragging = _bulkDragSelecting;
+								_bulkDragSelecting = false;
+								if (wasDragging && !_onDetailPage)
+									ShowRackList();
+							});
+							val15.triggers.Add(endDragEntry);
+						}
 					}
 					else
 					{
@@ -3540,6 +4094,338 @@ public class RackBuilderCore : MelonMod
 		UnityEngine.Object.Destroy((UnityEngine.Object)(object)((Component)componentInChildren).gameObject);
 		mount.isRackInstantiated = false;
 		((MelonBase)this).LoggerInstance.Msg($"Removed rack at {((UnityEngine.Object)((Component)mount).gameObject).name}: {num2} items, {num} cables");
+	}
+
+	private void BulkRemoveAllEquipment()
+	{
+		int totalRemoved = 0;
+		foreach (Rack rack in _bulkSelectedRacks.ToList())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+				continue;
+			RackMount mount = ((Component)rack).GetComponentInParent<RackMount>();
+			if ((UnityEngine.Object)(object)mount == (UnityEngine.Object)null)
+				continue;
+			if (ClearRackEquipment(mount))
+				totalRemoved++;
+		}
+		((MelonBase)this).LoggerInstance.Msg($"[Bulk] Removed equipment from {totalRemoved}/{_bulkSelectedRacks.Count} racks");
+		InvalidateRackSnapshot();
+		QueueSaveTopology();
+		_bulkSelectedRacks.Clear();
+		ShowRackList();
+	}
+
+	private void BulkSetRackColor()
+	{
+		Color color = GetConfiguredRackColor();
+		int applied = 0;
+		EnsureRackColorsLoaded();
+		foreach (Rack rack in _bulkSelectedRacks.ToList())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+				continue;
+			if (ApplyRackColor(rack, color))
+			{
+				applied++;
+				string key = BuildRackRoleKey(rack);
+				if (!string.IsNullOrEmpty(key))
+					_rackColorsByKey[key] = color;
+			}
+		}
+		SaveRackColors();
+		((MelonBase)this).LoggerInstance.Msg($"[Bulk] Applied color to {applied}/{_bulkSelectedRacks.Count} racks");
+		_bulkSelectedRacks.Clear();
+		ShowRackList();
+	}
+
+	private void BulkOpenSelectedRacks()
+	{
+		List<Rack> selected = _bulkSelectedRacks.Where((Rack r) => (UnityEngine.Object)(object)r != (UnityEngine.Object)null).ToList();
+		if (selected.Count == 0)
+		{
+			ShowRackList();
+			return;
+		}
+		if (selected.Count == 1)
+		{
+			_selectedRack = selected[0];
+			_pendingBulkClearConfirmation = false;
+			_bulkDragSelecting = false;
+			_bulkSelectedServerAnchors.Clear();
+			_bulkSelectedRacks.Clear();
+			_onDetailPage = true;
+			ShowRackDetail();
+			return;
+		}
+
+		Rack target = selected[0];
+		int moved = 0;
+		int skipped = 0;
+
+		for (int i = 1; i < selected.Count; i++)
+		{
+			Rack source = selected[i];
+			if ((UnityEngine.Object)(object)source == (UnityEngine.Object)null)
+				continue;
+
+			List<UsableObject> equipment = CollectRackUsableObjects(source);
+			equipment.Sort((UsableObject a, UsableObject b) => b.storedPosition.CompareTo(a.storedPosition));
+
+			foreach (UsableObject uo in equipment)
+			{
+				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null)
+					continue;
+				int size = uo.sizeInU;
+				if (size < 1)
+					size = 1;
+				int currentSlot = uo.storedPosition;
+
+				if (source.isPositionUsed != null && currentSlot >= 0)
+				{
+					for (int c = 0; c < size && currentSlot + c < ((Il2CppArrayBase<int>)(object)source.isPositionUsed).Length; c++)
+						((Il2CppArrayBase<int>)(object)source.isPositionUsed)[currentSlot + c] = 0;
+				}
+
+				int freeSlot = FindFreeSlot(target, size);
+				if (freeSlot < 0)
+				{
+					skipped++;
+					continue;
+				}
+
+				RackPosition targetPos = ((Il2CppArrayBase<RackPosition>)(object)target.positions)[freeSlot];
+				if ((UnityEngine.Object)(object)targetPos == (UnityEngine.Object)null)
+				{
+					skipped++;
+					continue;
+				}
+
+				((Component)uo).transform.SetParent(((Component)targetPos).transform);
+				((Component)uo).transform.localPosition = Vector3.zero;
+				((Component)uo).transform.localRotation = Quaternion.identity;
+
+				Rigidbody rb = ((Component)uo).GetComponent<Rigidbody>();
+				if ((UnityEngine.Object)(object)rb != (UnityEngine.Object)null)
+				{
+					rb.isKinematic = true;
+					rb.useGravity = false;
+				}
+
+				uo.currentRackPosition = targetPos;
+				uo.rackPositionUID = targetPos.rackPosGlobalUID;
+				uo.storedPosition = freeSlot;
+
+				if (target.isPositionUsed != null && freeSlot >= 0)
+				{
+					for (int c2 = 0; c2 < size && freeSlot + c2 < ((Il2CppArrayBase<int>)(object)target.isPositionUsed).Length; c2++)
+						((Il2CppArrayBase<int>)(object)target.isPositionUsed)[freeSlot + c2] = 1;
+				}
+
+				moved++;
+			}
+
+			if (source.isPositionUsed != null)
+			{
+				for (int j = 0; j < ((Il2CppArrayBase<int>)(object)source.isPositionUsed).Length; j++)
+					((Il2CppArrayBase<int>)(object)source.isPositionUsed)[j] = 0;
+			}
+		}
+
+		_selectedRack = target;
+		_pendingBulkClearConfirmation = false;
+		_bulkDragSelecting = false;
+		_bulkSelectedServerAnchors.Clear();
+		_bulkSelectedRacks.Clear();
+		_onDetailPage = true;
+		QueueSaveTopology();
+
+		if (skipped > 0)
+			((MelonBase)this).LoggerInstance.Msg($"[Bulk] Merged {moved} items into {((UnityEngine.Object)((Component)target).gameObject).name} ({skipped} skipped - not enough space)");
+		else
+			((MelonBase)this).LoggerInstance.Msg($"[Bulk] Merged {moved} items into {((UnityEngine.Object)((Component)target).gameObject).name}");
+
+		ShowRackDetail();
+	}
+
+	private int FindFreeSlot(Rack rack, int size)
+	{
+		if (rack.positions == null || rack.isPositionUsed == null)
+			return -1;
+		int total = ((Il2CppArrayBase<RackPosition>)(object)rack.positions).Length;
+		for (int slot = 0; slot <= total - size; slot++)
+		{
+			bool free = true;
+			for (int check = 0; check < size; check++)
+			{
+				if (((Il2CppArrayBase<int>)(object)rack.isPositionUsed)[slot + check] != 0)
+				{
+					free = false;
+					break;
+				}
+			}
+			if (free)
+				return slot;
+		}
+		return -1;
+	}
+
+	private void BulkRemoveSelectedRacks()
+	{
+		int removed = 0;
+		foreach (Rack rack in _bulkSelectedRacks.ToList())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+				continue;
+			RackMount mount = ((Component)rack).GetComponentInParent<RackMount>();
+			if ((UnityEngine.Object)(object)mount == (UnityEngine.Object)null)
+				continue;
+			RemoveRackAtMount(mount);
+			removed++;
+		}
+		((MelonBase)this).LoggerInstance.Msg($"[Bulk] Removed {removed} racks");
+		InvalidateRackSnapshot();
+		QueueSaveTopology();
+		_bulkSelectedRacks.Clear();
+		ShowRackList();
+	}
+
+	private void ShowBulkRackContents()
+	{
+		ClearContent();
+		AddTitle("Bulk Edit: Rack Contents");
+
+		List<(Rack rack, int anchor, int size, string label, string colorType, UsableObject uo)> allServers = new List<(Rack rack, int anchor, int size, string label, string colorType, UsableObject uo)>();
+
+		foreach (Rack rack in _bulkSelectedRacks.ToList())
+		{
+			if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || rack.positions == null)
+				continue;
+			string rackName = rack.name ?? "Unknown";
+			int slotCount = ((Il2CppArrayBase<RackPosition>)(object)rack.positions).Length;
+			HashSet<int> slotsFound = new HashSet<int>();
+			for (int j = 0; j < slotCount; j++)
+			{
+				if (slotsFound.Contains(j))
+					continue;
+				RackPosition rp = ((Il2CppArrayBase<RackPosition>)(object)rack.positions)[j];
+				if ((UnityEngine.Object)(object)rp == (UnityEngine.Object)null)
+					continue;
+				Transform rpT = ((Component)rp).transform;
+				for (int k = 0; k < rpT.childCount; k++)
+				{
+					Transform child = rpT.GetChild(k);
+					if ((UnityEngine.Object)(object)child == (UnityEngine.Object)null)
+						continue;
+					string label = null;
+					string colorType = null;
+					int size = 1;
+					UsableObject uo = ((Component)child).GetComponent<UsableObject>() ?? ((Component)child).GetComponentInChildren<UsableObject>();
+					if ((UnityEngine.Object)(object)uo != (UnityEngine.Object)null)
+					{
+						size = (uo.sizeInU > 0) ? uo.sizeInU : 1;
+						label = DescribeUsableObject(uo);
+						if (label != null)
+							colorType = ClassifyLabel(label);
+					}
+					else
+					{
+						Server srv = ((Component)child).GetComponentInChildren<Server>();
+						if ((UnityEngine.Object)(object)srv != (UnityEngine.Object)null)
+						{
+							uo = (UsableObject)(object)srv;
+							size = (((UsableObject)srv).sizeInU > 0) ? ((UsableObject)srv).sizeInU : 3;
+							label = srv.isBroken ? $"Server {size}U BROKEN" : (srv.isOn ? $"Server {size}U [ON]" : $"Server {size}U [OFF]");
+							colorType = "Server";
+						}
+						else
+						{
+							NetworkSwitch sw = ((Component)child).GetComponentInChildren<NetworkSwitch>();
+							if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null)
+							{
+								uo = (UsableObject)(object)sw;
+								size = 1;
+								label = sw.isBroken ? "Switch BROKEN" : (sw.isOn ? "Switch [ON]" : "Switch [OFF]");
+								colorType = "Switch";
+							}
+							else
+							{
+								PatchPanel pp = ((Component)child).GetComponentInChildren<PatchPanel>();
+								if ((UnityEngine.Object)(object)pp != (UnityEngine.Object)null)
+								{
+									size = 1;
+									label = "Patch Panel";
+									colorType = "PatchPanel";
+								}
+							}
+						}
+					}
+					if (label != null)
+					{
+						allServers.Add((rack, j, size, $"[{rackName}] {label}", colorType, uo));
+						for (int u = j; u < j + size && u < slotCount; u++)
+							slotsFound.Add(u);
+						break;
+					}
+				}
+			}
+		}
+
+		_bulkDragSelecting = false;
+
+		if (allServers.Count == 0)
+		{
+			AddLabel("  No installed items found in selected racks.");
+			AddClickableRow("  BACK TO OVERVIEW", new Color(0.3f, 0.3f, 0.3f), delegate
+			{
+				ShowRackList();
+			});
+			return;
+		}
+
+		AddColorLabel($"  {allServers.Count} item(s) across {_bulkSelectedRacks.Count} rack(s)", new Color(0.6f, 0.6f, 0.6f));
+		if (_bulkSelectedServerAnchors.Count > 0)
+		{
+			AddClickableRow($"  REMOVE SELECTED ({_bulkSelectedServerAnchors.Count})", new Color(0.55f, 0.15f, 0.15f), delegate
+			{
+				List<int> indices = _bulkSelectedServerAnchors.OrderByDescending((int x) => x).ToList();
+				foreach (int idx in indices)
+				{
+					if (idx < 0 || idx >= allServers.Count)
+						continue;
+					Rack targetRack = allServers[idx].rack;
+					int targetAnchor = allServers[idx].anchor;
+					int targetSize = allServers[idx].size;
+					_selectedRack = targetRack;
+					RemoveItemByAnchor(targetAnchor, targetSize);
+				}
+				_bulkSelectedServerAnchors.Clear();
+				_bulkDragSelecting = false;
+				ShowBulkRackContents();
+			});
+			AddClickableRow("  CLEAR SELECTION", new Color(0.25f, 0.25f, 0.25f), delegate
+			{
+				_bulkSelectedServerAnchors.Clear();
+				_bulkDragSelecting = false;
+				ShowBulkRackContents();
+			});
+		}
+		AddSpacer();
+		AddColorLabel("  Hold Ctrl and click/drag items to select:", new Color(0.9f, 0.75f, 0.45f));
+		for (int i = 0; i < allServers.Count; i++)
+		{
+			int localIdx = i;
+			var (_, _, size, label, colorType, _) = allServers[i];
+			string rowText = $"    {label}  ({size}U)   [X]";
+			AddBulkSelectableServerRow(localIdx, size, rowText, GetColor(colorType));
+		}
+		AddSpacer();
+		AddClickableRow("  BACK TO OVERVIEW", new Color(0.3f, 0.3f, 0.3f), delegate
+		{
+			_bulkSelectedServerAnchors.Clear();
+			_bulkDragSelecting = false;
+			ShowRackList();
+		});
 	}
 
 	private HashSet<int> GetRackCableIds(Rack rack)
@@ -3757,6 +4643,11 @@ public class RackBuilderCore : MelonMod
 		return result;
 	}
 
+	private bool CreateCable(CablePositions cablePositions, CableLink startPort, CableLink endPort, IEnumerable<Transform> waypoints, CableLink.TypeOfLink startType, CableLink.TypeOfLink endType, string serverId = "")
+	{
+		return CreateCable(cablePositions, startPort, endPort, waypoints, startType, endType, serverId, -1);
+	}
+
 	private bool CreateCable(CablePositions cablePositions, CableLink startPort, CableLink endPort, IEnumerable<Transform> waypoints, CableLink.TypeOfLink startType, CableLink.TypeOfLink endType, string serverId = "", int customerId = -1)
 	{
 		if ((UnityEngine.Object)(object)cablePositions == (UnityEngine.Object)null || (UnityEngine.Object)(object)startPort == (UnityEngine.Object)null || (UnityEngine.Object)(object)endPort == (UnityEngine.Object)null)
@@ -3789,6 +4680,22 @@ public class RackBuilderCore : MelonMod
 				{
 				}
 				return false;
+			}
+			try
+			{
+				if (cablePositions.cableMaterials.TryGetValue(cableId, out Material cableMat) && (UnityEngine.Object)(object)cableMat != (UnityEngine.Object)null)
+				{
+					Color cableColor = ((uint)_cableColorIndex < (uint)_cableColors.Length)
+						? _cableColors[_cableColorIndex].Color
+						: GetSelectedCableColor().Color;
+					if (cableMat.HasProperty("_BaseColor"))
+						cableMat.SetColor("_BaseColor", cableColor);
+					if (cableMat.HasProperty("_Color"))
+						cableMat.SetColor("_Color", cableColor);
+				}
+			}
+			catch
+			{
 			}
 			startPort.cableIDsOnLink = cableId;
 			endPort.cableIDsOnLink = cableId;
@@ -4416,6 +5323,47 @@ public class RackBuilderCore : MelonMod
 				AutoFillSfpModules();
 			});
 		}
+		RackColorChoice selectedColor = GetSelectedRackColorChoice();
+		AddSpacer();
+		AddColorLabel("  Rack Color Picker", Color.white);
+		AddClickableRow($"  PRESET SEED - {selectedColor.Name}", selectedColor.Color * 0.75f, delegate
+		{
+			CycleRackColorChoice();
+			ShowRackDetail();
+		});
+		AddColorLabel($"  Current RGB: {Mathf.RoundToInt(_customRackColor.r * 255f)} / {Mathf.RoundToInt(_customRackColor.g * 255f)} / {Mathf.RoundToInt(_customRackColor.b * 255f)}", new Color(0.8f, 0.8f, 0.8f));
+		AddColorChannelRow("  Red", _customRackColor.r, delegate(float v)
+		{
+			_customRackColor.r = v;
+		});
+		AddColorChannelRow("  Green", _customRackColor.g, delegate(float v)
+		{
+			_customRackColor.g = v;
+		});
+		AddColorChannelRow("  Blue", _customRackColor.b, delegate(float v)
+		{
+			_customRackColor.b = v;
+		});
+		AddClickableRow("  APPLY CUSTOM COLOR TO THIS RACK", _customRackColor * 0.9f, delegate
+		{
+			bool changedColor = ApplyRackColor(_selectedRack, GetConfiguredRackColor());
+			if (changedColor)
+			{
+				EnsureRackColorsLoaded();
+				string key = BuildRackRoleKey(_selectedRack);
+				if (!string.IsNullOrEmpty(key))
+				{
+					_rackColorsByKey[key] = GetConfiguredRackColor();
+					SaveRackColors();
+				}
+				((MelonBase)this).LoggerInstance.Msg("Applied custom rack color");
+			}
+			else
+			{
+				((MelonBase)this).LoggerInstance.Warning("Could not apply color: no compatible material color properties found.");
+			}
+			ShowRackDetail();
+		});
 		string selectedRackRole = GetRackRole(_selectedRack);
 		AddSpacer();
 		AddColorLabel($"  Rack Role: {selectedRackRole.ToUpperInvariant()}", Color.white);
@@ -7093,6 +8041,179 @@ public class RackBuilderCore : MelonMod
 		AddClickableRow(text, bgColor, onClick);
 	}
 
+	private void AddColorChannelRow(string channelName, float value, Action<float> onChanged)
+	{
+		GameObject row = CreateRow(30f);
+		Image bg = row.AddComponent<Image>();
+		((Graphic)bg).color = new Color(0.16f, 0.16f, 0.16f);
+		HorizontalLayoutGroup layout = row.AddComponent<HorizontalLayoutGroup>();
+		((HorizontalOrVerticalLayoutGroup)layout).spacing = 4f;
+		((HorizontalOrVerticalLayoutGroup)layout).childForceExpandWidth = false;
+		((HorizontalOrVerticalLayoutGroup)layout).childControlWidth = false;
+		RectOffset padding = new RectOffset();
+		padding.left = 8;
+		padding.right = 8;
+		((LayoutGroup)layout).padding = padding;
+
+		GameObject labelObj = new GameObject("Label");
+		labelObj.transform.SetParent(row.transform, false);
+		labelObj.AddComponent<RectTransform>();
+		LayoutElement labelLayout = labelObj.AddComponent<LayoutElement>();
+		labelLayout.preferredWidth = 96f;
+		TextMeshProUGUI label = labelObj.AddComponent<TextMeshProUGUI>();
+		((TMP_Text)label).text = channelName;
+		((TMP_Text)label).fontSize = 13f;
+		((TMP_Text)label).alignment = (TextAlignmentOptions)513;
+		((Graphic)label).color = Color.white;
+
+		GameObject minusObj = new GameObject("Minus");
+		minusObj.transform.SetParent(row.transform, false);
+		minusObj.AddComponent<RectTransform>();
+		LayoutElement minusLayout = minusObj.AddComponent<LayoutElement>();
+		minusLayout.preferredWidth = 28f;
+		Image minusBg = minusObj.AddComponent<Image>();
+		((Graphic)minusBg).color = new Color(0.28f, 0.18f, 0.18f);
+		Button minusButton = minusObj.AddComponent<Button>();
+		float currentValue = value;
+		((UnityEvent)minusButton.onClick).AddListener((Action)delegate
+		{
+			onChanged(Clamp01(currentValue - 0.05f));
+			ShowRackDetail();
+		});
+		TextMeshProUGUI minusText = new GameObject("T").AddComponent<TextMeshProUGUI>();
+		((TMP_Text)minusText).transform.SetParent(minusObj.transform, false);
+		((TMP_Text)minusText).text = "-";
+		((TMP_Text)minusText).fontSize = 16f;
+		((TMP_Text)minusText).alignment = (TextAlignmentOptions)514;
+		((Graphic)minusText).color = Color.white;
+		RectTransform minusRect = ((Component)minusText).GetComponent<RectTransform>();
+		minusRect.anchorMin = Vector2.zero;
+		minusRect.anchorMax = Vector2.one;
+		minusRect.sizeDelta = Vector2.zero;
+
+		GameObject valueObj = new GameObject("Value");
+		valueObj.transform.SetParent(row.transform, false);
+		valueObj.AddComponent<RectTransform>();
+		LayoutElement valueLayout = valueObj.AddComponent<LayoutElement>();
+		valueLayout.preferredWidth = 54f;
+		TextMeshProUGUI valueText = valueObj.AddComponent<TextMeshProUGUI>();
+		((TMP_Text)valueText).text = Mathf.RoundToInt(value * 255f).ToString();
+		((TMP_Text)valueText).fontSize = 13f;
+		((TMP_Text)valueText).alignment = (TextAlignmentOptions)514;
+		((Graphic)valueText).color = new Color(0.85f, 0.85f, 0.85f);
+
+		GameObject plusObj = new GameObject("Plus");
+		plusObj.transform.SetParent(row.transform, false);
+		plusObj.AddComponent<RectTransform>();
+		LayoutElement plusLayout = plusObj.AddComponent<LayoutElement>();
+		plusLayout.preferredWidth = 28f;
+		Image plusBg = plusObj.AddComponent<Image>();
+		((Graphic)plusBg).color = new Color(0.18f, 0.28f, 0.18f);
+		Button plusButton = plusObj.AddComponent<Button>();
+		((UnityEvent)plusButton.onClick).AddListener((Action)delegate
+		{
+			onChanged(Clamp01(currentValue + 0.05f));
+			ShowRackDetail();
+		});
+		TextMeshProUGUI plusText = new GameObject("T").AddComponent<TextMeshProUGUI>();
+		((TMP_Text)plusText).transform.SetParent(plusObj.transform, false);
+		((TMP_Text)plusText).text = "+";
+		((TMP_Text)plusText).fontSize = 16f;
+		((TMP_Text)plusText).alignment = (TextAlignmentOptions)514;
+		((Graphic)plusText).color = Color.white;
+		RectTransform plusRect = ((Component)plusText).GetComponent<RectTransform>();
+		plusRect.anchorMin = Vector2.zero;
+		plusRect.anchorMax = Vector2.one;
+		plusRect.sizeDelta = Vector2.zero;
+	}
+
+	private void AddBulkSelectableServerRow(int anchor, int size, string text, Color baseColor)
+	{
+		GameObject row = CreateRow(32f);
+		Image bg = row.AddComponent<Image>();
+		bool isSelected = _bulkSelectedServerAnchors.Contains(anchor);
+		Color selectedColor = new Color(0.65f, 0.35f, 0.12f);
+		((Graphic)bg).color = isSelected ? selectedColor : baseColor;
+		Button button = row.AddComponent<Button>();
+		ColorBlock colors = ((Selectable)button).colors;
+		colors.highlightedColor = GetHoverColor(isSelected ? selectedColor : baseColor);
+		((Selectable)button).colors = colors;
+
+		GameObject textObj = new GameObject("Text");
+		textObj.transform.SetParent(row.transform, false);
+		RectTransform textRect = textObj.AddComponent<RectTransform>();
+		textRect.anchorMin = Vector2.zero;
+		textRect.anchorMax = Vector2.one;
+		textRect.sizeDelta = Vector2.zero;
+		TextMeshProUGUI label = textObj.AddComponent<TextMeshProUGUI>();
+		((TMP_Text)label).text = text;
+		((TMP_Text)label).fontSize = 14f;
+		((TMP_Text)label).alignment = (TextAlignmentOptions)513;
+		((Graphic)label).color = Color.white;
+		((TMP_Text)label).enableWordWrapping = false;
+
+		int localAnchor = anchor;
+		Action applyVisual = delegate
+		{
+			bool nowSelected = _bulkSelectedServerAnchors.Contains(localAnchor);
+			((Graphic)bg).color = nowSelected ? selectedColor : baseColor;
+			ColorBlock cb = ((Selectable)button).colors;
+			cb.highlightedColor = GetHoverColor(nowSelected ? selectedColor : baseColor);
+			((Selectable)button).colors = cb;
+		};
+
+		((UnityEvent)button.onClick).AddListener((Action)delegate
+		{
+			if (!_bulkEditMode || !IsCtrlHeld())
+				return;
+			bool targetState = !_bulkSelectedServerAnchors.Contains(localAnchor);
+			SetBulkServerSelection(localAnchor, targetState);
+			applyVisual();
+		});
+
+		EventTrigger trigger = row.AddComponent<EventTrigger>();
+
+		EventTrigger.Entry downEntry = new EventTrigger.Entry();
+		downEntry.eventID = EventTriggerType.PointerDown;
+		((UnityEvent<BaseEventData>)(object)downEntry.callback).AddListener((Action<BaseEventData>)delegate
+		{
+			if (!_bulkEditMode || !IsCtrlHeld())
+				return;
+			_bulkDragSelecting = true;
+			_bulkDragTargetSelectState = !_bulkSelectedServerAnchors.Contains(localAnchor);
+			SetBulkServerSelection(localAnchor, _bulkDragTargetSelectState);
+			applyVisual();
+		});
+		trigger.triggers.Add(downEntry);
+
+		EventTrigger.Entry enterEntry = new EventTrigger.Entry();
+		enterEntry.eventID = EventTriggerType.PointerEnter;
+		((UnityEvent<BaseEventData>)(object)enterEntry.callback).AddListener((Action<BaseEventData>)delegate
+		{
+			if (!_bulkEditMode || !_bulkDragSelecting || !IsCtrlHeld())
+				return;
+			SetBulkServerSelection(localAnchor, _bulkDragTargetSelectState);
+			applyVisual();
+		});
+		trigger.triggers.Add(enterEntry);
+
+		EventTrigger.Entry upEntry = new EventTrigger.Entry();
+		upEntry.eventID = EventTriggerType.PointerUp;
+		((UnityEvent<BaseEventData>)(object)upEntry.callback).AddListener((Action<BaseEventData>)delegate
+		{
+			_bulkDragSelecting = false;
+		});
+		trigger.triggers.Add(upEntry);
+
+		EventTrigger.Entry endDragEntry = new EventTrigger.Entry();
+		endDragEntry.eventID = EventTriggerType.EndDrag;
+		((UnityEvent<BaseEventData>)(object)endDragEntry.callback).AddListener((Action<BaseEventData>)delegate
+		{
+			_bulkDragSelecting = false;
+		});
+		trigger.triggers.Add(endDragEntry);
+	}
+
 	private void AddQuantityRow(string itemName, int sizeInU, Color bgColor, int choiceIdx, int freeU)
 	{
 		//IL_003a: Unknown result type (might be due to invalid IL or missing references)
@@ -7385,6 +8506,8 @@ public class RackBuilderCore : MelonMod
 	public override void OnDeinitializeMelon()
 	{
 		_pendingRemovalUsableIds.Clear();
+		_bulkSelectedServerAnchors.Clear();
+		_bulkSelectedRacks.Clear();
 		_profileNameDialogShouldRemainOpen = false;
 		SetProfileDialogInputIsolation(false);
 		try
