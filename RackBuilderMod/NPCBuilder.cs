@@ -93,7 +93,7 @@ public static class NPCBuilder
 				foreach (CableLink cl in val7.GetComponentsInChildren<CableLink>())
 				{
 					if ((UnityEngine.Object)(object)cl != (UnityEngine.Object)null)
-						cl.cableIDsOnLink = 0;
+						cl.cableIDsOnLink = -1;
 				}
 				val7.transform.SetParent(((Component)val4).transform);
 				val7.transform.localPosition = Vector3.zero;
@@ -107,7 +107,7 @@ public static class NPCBuilder
 				Server component2 = val7.GetComponent<Server>();
 				if ((UnityEngine.Object)(object)component2 != (UnityEngine.Object)null)
 				{
-					component2.ServerID = "Build_" + Guid.NewGuid().ToString().Substring(0, 8);
+					component2.ServerID = "Mod_" + Guid.NewGuid().ToString().Substring(0, 8);
 					component2.serverType = itemChoice.prefabIndex;
 					((UsableObject)component2).prefabID = itemChoice.prefabIndex;
 					component2.isBroken = true;
@@ -127,7 +127,7 @@ public static class NPCBuilder
 				NetworkSwitch component4 = val7.GetComponent<NetworkSwitch>();
 				if ((UnityEngine.Object)(object)component4 != (UnityEngine.Object)null)
 				{
-					component4.switchId = "Build_" + Guid.NewGuid().ToString().Substring(0, 8);
+					component4.switchId = "Mod_" + Guid.NewGuid().ToString().Substring(0, 8);
 					component4.switchType = itemChoice.prefabIndex;
 					component4.isBroken = true;
 					component4.isOn = false;

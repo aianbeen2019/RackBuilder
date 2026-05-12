@@ -10,6 +10,7 @@ using Il2Cpp;
 using Il2CppInterop.Runtime.InteropTypes;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Il2CppTMPro;
+using HarmonyLib;
 using MelonLoader;
 using UnityEngine;
 using UnityEngine.Events;
@@ -20,6 +21,10 @@ namespace RackBuilderMod;
 
 public class RackBuilderCore : MelonMod
 {
+	private static readonly JsonSerializerOptions IndentedJsonOptions = new JsonSerializerOptions { WriteIndented = true };
+
+	private static RackBuilderCore _instance;
+
 	public struct ItemChoice
 	{
 		public string name;
@@ -91,10 +96,53 @@ public class RackBuilderCore : MelonMod
 		[JsonPropertyName("racks")]
 		public List<RackRoleEntry> Racks { get; set; } = new List<RackRoleEntry>();
 	}
+
+	[Serializable]
+	public class RackProfileItemEntry
+	{
+		[JsonPropertyName("category")]
+		public string Category { get; set; }
+
+		[JsonPropertyName("prefabIndex")]
+		public int PrefabIndex { get; set; }
+
+		[JsonPropertyName("sizeInU")]
+		public int SizeInU { get; set; }
+
+		[JsonPropertyName("anchorSlot")]
+		public int AnchorSlot { get; set; }
+	}
+
+	[Serializable]
+	public class RackProfileEntry
+	{
+		[JsonPropertyName("name")]
+		public string Name { get; set; }
+
+		[JsonPropertyName("createdUtc")]
+		public string CreatedUtc { get; set; }
+
+		[JsonPropertyName("rackUnits")]
+		public int RackUnits { get; set; }
+
+		[JsonPropertyName("rackRole")]
+		public string RackRole { get; set; }
+
+		[JsonPropertyName("items")]
+		public List<RackProfileItemEntry> Items { get; set; } = new List<RackProfileItemEntry>();
+	}
+
+	[Serializable]
+	public class RackProfileData
+	{
+		[JsonPropertyName("profiles")]
+		public List<RackProfileEntry> Profiles { get; set; } = new List<RackProfileEntry>();
+	}
 	
 
 	private bool _integrated;
 	private bool _startupCableRestoreQueued;
+	private bool _startupCableRestoreInFlight;
 	private int _nextStartupRestoreCheckFrame;
 	private int _nextStartupTopologyCheckFrame;
 	private int _nextPerformanceHeartbeatFrame;
@@ -108,6 +156,7 @@ public class RackBuilderCore : MelonMod
 	// Deferred save state — prevents multiple rapid saves from stacking 235ms hits.
 	private bool _saveTopologyPending;
 	private int _pendingSaveDelayFrames;
+	private int _topologyWriteVersion;
 
 	// Server / switch / panel caches — share TTL with rack/customer snapshots
 	private readonly List<Server> _cachedServers = new List<Server>();
@@ -143,9 +192,28 @@ public class RackBuilderCore : MelonMod
 	// Cable IDs created by AutoWire — shielded from the post-placement scrub coroutine.
 	private HashSet<int> _autoWireProtectedCableIds = new HashSet<int>();
 
+	// UsableObject IDs queued for destroy this frame; temporarily ignored by rack detail scans.
+	private readonly HashSet<int> _pendingRemovalUsableIds = new HashSet<int>();
+
 	private ComputerShop _shop;
 
 	private GameObject _rackScreen;
+
+	private readonly List<ButtonExtended> _rackReturnButtons = new List<ButtonExtended>();
+
+	private readonly List<ButtonExtended> _profileDialogSuppressedButtons = new List<ButtonExtended>();
+
+	private readonly Dictionary<int, bool> _profileDialogSuppressedButtonEnabled = new Dictionary<int, bool>();
+
+	private readonly Dictionary<int, bool> _profileDialogSuppressedButtonInteractable = new Dictionary<int, bool>();
+
+	private bool _profileDialogSuppressesShopInput;
+
+	private bool _profileDialogSavedSendNavigationEvents;
+
+	private bool _profileDialogHasSavedSendNavigationEvents;
+
+	private bool _profileNameDialogShouldRemainOpen;
 
 	private Transform _contentParent;
 
@@ -164,11 +232,20 @@ public class RackBuilderCore : MelonMod
 	private Dictionary<int, int> _cartQty = new Dictionary<int, int>();
 
 	private List<(int sfpType, float speed, int prefabIdx, string name)> _sfpPrefabInfo;
+	private const string PortFamilySfp = "sfp";
+	private const string PortFamilyQsfp = "qsfp";
+	private const string PortFamilyUnknown = "unknown";
+	private int _autoFillDefaultSfpPrefabIdx = -1; // -1 = auto best-match behavior
+	private int _autoFillDefaultQsfpPrefabIdx = -1; // -1 = auto best-match behavior
+	private readonly Dictionary<int, int> _autoFillSfpPrefabBySwitchId = new Dictionary<int, int>();
+	private readonly Dictionary<int, int> _autoFillQsfpPrefabBySwitchId = new Dictionary<int, int>();
 
 	private Dictionary<NetworkSwitch, Dictionary<int, float>> _switchTypeSpeedMap = new Dictionary<NetworkSwitch, Dictionary<int, float>>();
 
 	// When true, ShowRackDetail / ShowRackList calls are no-ops (background auto-wire pass).
 	private bool _suppressUiUpdates;
+
+	private bool _batchAutoWireInProgress;
 
 	private List<CableLink> _cachedRackRailClips;
 
@@ -189,6 +266,26 @@ public class RackBuilderCore : MelonMod
 	private bool _rackRolesLoaded;
 
 	private Dictionary<string, string> _rackRolesByKey = new Dictionary<string, string>();
+
+	private bool _rackProfilesLoaded;
+
+	private readonly Dictionary<string, RackProfileEntry> _rackProfilesByName = new Dictionary<string, RackProfileEntry>(StringComparer.OrdinalIgnoreCase);
+
+	private string _armedProfileName;
+
+	private bool _profileNameDialogActive;
+
+	private bool _profileNameDialogReturnToDetail;
+
+	private string _profileNameDialogTitle;
+
+	private string _profileNameDialogInitialValue;
+
+	private InputField _profileNameDialogInput;
+
+	private Action<string> _profileNameDialogConfirmAction;
+
+	private Font _profileNameInputFont;
 
 	private void LogPlacementDebugState(string stage, Server srv, NetworkSwitch sw)
 	{
@@ -255,6 +352,8 @@ public class RackBuilderCore : MelonMod
 
 	private void LogPerformanceEvent(string tag, long elapsedMs, string details = "", long thresholdMs = SlowPathThresholdMs)
 	{
+		if (!_enableVerboseDiagnostics)
+			return;
 		if (elapsedMs < thresholdMs)
 			return;
 		((MelonBase)this).LoggerInstance.Msg($"[Perf]{tag} {elapsedMs}ms{details}");
@@ -262,7 +361,17 @@ public class RackBuilderCore : MelonMod
 
 	public override void OnInitializeMelon()
 	{
-		((MelonBase)this).LoggerInstance.Msg("Rack Builder Mod v1.1.3 initialized!");
+		_instance = this;
+		try
+		{
+			int patchedCount = ((MelonBase)this).HarmonyInstance.CreateClassProcessor(typeof(GameObjectSetActiveModalGuardPatch)).Patch().Count;
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Modal guard patches applied: {patchedCount}");
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("[RackBuilder] Failed to apply modal close guard patch: " + ex.Message);
+		}
+		((MelonBase)this).LoggerInstance.Msg("Rack Builder Mod v1.1.4 initialized!");
 	}
 
 	public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -272,6 +381,7 @@ public class RackBuilderCore : MelonMod
 
 	private void FullReset()
 	{
+		SetProfileDialogInputIsolation(false);
 		_integrated = false;
 		// Destroy mod-created UI to prevent duplicates after same-scene save reload
 		if ((UnityEngine.Object)(object)_rackScreen != (UnityEngine.Object)null)
@@ -301,10 +411,17 @@ public class RackBuilderCore : MelonMod
 		_cachedClipsRack = null;
 		_cachedOverheadClips = null;
 		_sfpPrefabInfo = null;
+		_autoFillDefaultSfpPrefabIdx = -1;
+		_autoFillDefaultQsfpPrefabIdx = -1;
+		_autoFillSfpPrefabBySwitchId.Clear();
+		_autoFillQsfpPrefabBySwitchId.Clear();
 		_switchTypeSpeedMap.Clear();
 		_autoWireProtectedCableIds.Clear();
+		_pendingRemovalUsableIds.Clear();
 		_suppressUiUpdates = false;
+		_batchAutoWireInProgress = false;
 		_startupCableRestoreQueued = false;
+		_startupCableRestoreInFlight = false;
 		_nextStartupRestoreCheckFrame = 0;
 		_nextStartupTopologyCheckFrame = 0;
 		_cachedCablePositions = null;
@@ -319,8 +436,27 @@ public class RackBuilderCore : MelonMod
 		_cachedMounts.Clear(); _cachedMountsTime = -999f;
 		_cachedGameManager = null;
 		_cachedUsableObjects.Clear(); _cachedUsableObjectsTime = -999f;
+		_rackProfilesLoaded = false;
+		_rackProfilesByName.Clear();
+		_armedProfileName = null;
+		_profileNameDialogActive = false;
+		_profileNameDialogReturnToDetail = false;
+		_profileNameDialogTitle = null;
+		_profileNameDialogInitialValue = null;
+		_profileNameDialogInput = null;
+		_profileNameDialogConfirmAction = null;
+		_profileNameDialogShouldRemainOpen = false;
+		_profileNameInputFont = null;
+		_rackReturnButtons.Clear();
+		_profileDialogSuppressedButtons.Clear();
+		_profileDialogSuppressedButtonEnabled.Clear();
+		_profileDialogSuppressedButtonInteractable.Clear();
+		_profileDialogSuppressesShopInput = false;
+		_profileDialogHasSavedSendNavigationEvents = false;
+		_profileDialogSavedSendNavigationEvents = true;
 		_saveTopologyPending = false;
 		_pendingSaveDelayFrames = 0;
+		_topologyWriteVersion = 0;
 	}
 
 	/// <summary>
@@ -349,33 +485,38 @@ public class RackBuilderCore : MelonMod
 
 	public override void OnUpdate()
 	{
-		Stopwatch overall = Stopwatch.StartNew();
+		float overallStart = Time.realtimeSinceStartup;
+		long integrateMs = 0L;
 		if (!_integrated)
 		{
-			Stopwatch integrateWatch = Stopwatch.StartNew();
+			float integrateStart = Time.realtimeSinceStartup;
 			TryIntegrate();
-			integrateWatch.Stop();
-			LogPerformanceEvent("[OnUpdate] TryIntegrate", integrateWatch.ElapsedMilliseconds, $" (frame={Time.frameCount})");
+			integrateMs = (long)((Time.realtimeSinceStartup - integrateStart) * 1000f);
+			LogPerformanceEvent("[OnUpdate] TryIntegrate", integrateMs, $" (frame={Time.frameCount})");
 		}
-		Stopwatch restoreWatch = Stopwatch.StartNew();
+		if (_profileNameDialogActive || _profileNameDialogShouldRemainOpen)
+		{
+			EnforceProfileNameDialogModalState();
+		}
+		float restoreStart = Time.realtimeSinceStartup;
 		TryQueueStartupCableRestore();
-		restoreWatch.Stop();
-		LogPerformanceEvent("[OnUpdate] TryQueueStartupCableRestore", restoreWatch.ElapsedMilliseconds, $" (frame={Time.frameCount})");
-		overall.Stop();
-		if (overall.ElapsedMilliseconds >= SlowUpdateThresholdMs || Time.frameCount >= _nextPerformanceHeartbeatFrame)
+		long restoreMs = (long)((Time.realtimeSinceStartup - restoreStart) * 1000f);
+		LogPerformanceEvent("[OnUpdate] TryQueueStartupCableRestore", restoreMs, $" (frame={Time.frameCount})");
+		long overallMs = (long)((Time.realtimeSinceStartup - overallStart) * 1000f);
+		if (_enableVerboseDiagnostics && (overallMs >= SlowUpdateThresholdMs || Time.frameCount >= _nextPerformanceHeartbeatFrame))
 		{
 			_nextPerformanceHeartbeatFrame = Time.frameCount + PerformanceHeartbeatIntervalFrames;
 			// Use already-cached snapshot counts — do NOT call GetRackSnapshot/GetCustomerSnapshot here
 			// as that would trigger a new 37ms scene scan on top of the one already done this frame.
 			int rackCount = _cachedRackSnapshot.Count;
 			int customerCount = _cachedCustomerSnapshot.Count;
-			((MelonBase)this).LoggerInstance.Msg($"[Perf][OnUpdate] total={overall.ElapsedMilliseconds}ms integrated={_integrated} restoreQueued={_startupCableRestoreQueued} detailPage={_onDetailPage} selectedRack={((UnityEngine.Object)(object)_selectedRack != (UnityEngine.Object)null)} racks={rackCount} customers={customerCount} frame={Time.frameCount}");
+			((MelonBase)this).LoggerInstance.Msg($"[Perf][OnUpdate] total={overallMs}ms integrate={integrateMs}ms restore={restoreMs}ms integrated={_integrated} restoreQueued={_startupCableRestoreQueued} detailPage={_onDetailPage} selectedRack={((UnityEngine.Object)(object)_selectedRack != (UnityEngine.Object)null)} racks={rackCount} customers={customerCount} frame={Time.frameCount}");
 		}
 	}
 
 	private void TryQueueStartupCableRestore()
 	{
-		if (_startupCableRestoreQueued)
+		if (_startupCableRestoreQueued || _startupCableRestoreInFlight)
 			return;
 		int frame = Time.frameCount;
 		if (frame < _nextStartupRestoreCheckFrame)
@@ -384,13 +525,7 @@ public class RackBuilderCore : MelonMod
 		CablePositions cablePositions = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)cablePositions == (UnityEngine.Object)null)
 			return;
-		int rackCount = 0;
-		foreach (Rack rack in GetRackSnapshot())
-		{
-			if ((UnityEngine.Object)(object)rack != (UnityEngine.Object)null)
-				rackCount++;
-		}
-		if (rackCount == 0)
+		if (GetRackSnapshot().Count == 0)
 			return;
 
 		if (frame < _nextStartupTopologyCheckFrame)
@@ -405,6 +540,7 @@ public class RackBuilderCore : MelonMod
 			return;
 		}
 		_startupCableRestoreQueued = true;
+		_startupCableRestoreInFlight = true;
 		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Startup cable restore queued (live={liveCableCount}, expected={expectedCableCount})");
 		MelonCoroutines.Start(RestoreCablesDeferred(10));
 	}
@@ -446,14 +582,24 @@ public class RackBuilderCore : MelonMod
 			if (wasShowing)
 				ShowRackList();
 			// Restore persisted cables only; full rack-wide autowire on load can stall large saves.
-			MelonCoroutines.Start(RestoreCablesDeferred(10));
+			if (!_startupCableRestoreInFlight)
+			{
+				_startupCableRestoreQueued = true;
+				_startupCableRestoreInFlight = true;
+				MelonCoroutines.Start(RestoreCablesDeferred(10));
+			}
 			return;
 		}
 
 		if (ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount))
 		{
 			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Topology mismatch detected after menu reload (live={liveCableCount}, expected={expectedCableCount})");
-			MelonCoroutines.Start(RestoreCablesDeferred(10));
+			if (!_startupCableRestoreInFlight)
+			{
+				_startupCableRestoreQueued = true;
+				_startupCableRestoreInFlight = true;
+				MelonCoroutines.Start(RestoreCablesDeferred(10));
+			}
 		}
 	}
 
@@ -463,10 +609,27 @@ public class RackBuilderCore : MelonMod
 		for (int i = 0; i < frames; i++)
 			yield return null;
 		((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Restore-only cable pass starting…");
-		ClearOrphanedCableIds();
-		RestoreCableTopologyFromFile();
-		ClearEmptySfpPortSpeeds();
-		SaveCableTopology();
+		try
+		{
+			ClearOrphanedCableIds();
+			RestoreCableTopologyFromFile();
+			ClearEmptySfpPortSpeeds();
+		}
+		finally
+		{
+			_startupCableRestoreInFlight = false;
+		}
+
+		if (ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount))
+		{
+			_startupCableRestoreQueued = false;
+			_nextStartupRestoreCheckFrame = Time.frameCount + StartupRestoreCheckIntervalFrames;
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Restore pass incomplete (live={liveCableCount}, expected={expectedCableCount}) — scheduling retry.");
+		}
+		else
+		{
+			_startupCableRestoreQueued = true;
+		}
 		watch.Stop();
 		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Restore-only cable pass complete in {watch.ElapsedMilliseconds}ms");
 	}
@@ -636,6 +799,10 @@ public class RackBuilderCore : MelonMod
 	{
 		for (int i = 0; i < frames; i++)
 			yield return null;
+		if (_pendingRemovalUsableIds.Count > 0)
+		{
+			_pendingRemovalUsableIds.Clear();
+		}
 		if (_onDetailPage && (UnityEngine.Object)(object)_selectedRack != (UnityEngine.Object)null)
 			ShowRackDetail();
 	}
@@ -700,6 +867,46 @@ public class RackBuilderCore : MelonMod
 		((MelonBase)this).LoggerInstance.Msg($"[Perf][AutoWireAllRacksDeferred] frames={frames} wired={wiredCount} in {watch.ElapsedMilliseconds}ms");
 	}
 
+	private IEnumerator BatchAutoWireAllRacksFromFloorPlanDeferred(int frames)
+	{
+		if (_batchAutoWireInProgress)
+			yield break;
+		_batchAutoWireInProgress = true;
+		Stopwatch watch = Stopwatch.StartNew();
+		Rack savedRack = _selectedRack;
+		bool savedDetailPage = _onDetailPage;
+		int processed = 0;
+		int wiredCount = 0;
+		try
+		{
+			for (int i = 0; i < frames; i++)
+				yield return null;
+			((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Batch auto-wire from floor plan starting...");
+			_suppressUiUpdates = true;
+			foreach (Rack r in GetRackSnapshot())
+			{
+				if ((UnityEngine.Object)(object)r == (UnityEngine.Object)null)
+					continue;
+				_selectedRack = r;
+				AutowireRackSilent(ref wiredCount);
+				processed++;
+				if (processed % 4 == 0)
+					yield return null;
+			}
+		}
+		finally
+		{
+			_selectedRack = savedRack;
+			_onDetailPage = savedDetailPage;
+			_suppressUiUpdates = false;
+			_batchAutoWireInProgress = false;
+		}
+		QueueSaveTopology();
+		ShowRackList();
+		watch.Stop();
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Batch auto-wire complete - racks={processed}, cables={wiredCount}, time={watch.ElapsedMilliseconds}ms");
+	}
+
 	private static bool IsPlacedRackObject(Component component)
 	{
 		if ((UnityEngine.Object)(object)component == (UnityEngine.Object)null)
@@ -761,44 +968,58 @@ public class RackBuilderCore : MelonMod
 		return null;
 	}
 
-	private static bool TryBuildLiveTopologySnapshot(out string fingerprint, out int liveCableCount)
+	private static string BuildTopologyFingerprintFromSnapshots(IEnumerable<Server> servers, IEnumerable<NetworkSwitch> switches, IEnumerable<PatchPanel> panels, out int liveCableCount)
 	{
 		List<string> parts = new List<string>();
 		liveCableCount = 0;
-		foreach (Server server in UnityEngine.Object.FindObjectsOfType<Server>())
+		if (servers != null)
 		{
-			if ((UnityEngine.Object)(object)server == (UnityEngine.Object)null || server.cablelinks == null || !IsPlacedRackObject((Component)(object)server))
-				continue;
-			int rackPositionUid = GetRackPositionUid((Component)(object)server);
-			if (rackPositionUid <= 0)
-				continue;
-			parts.Add($"S:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)server.cablelinks).Length}");
-			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)server.cablelinks)
+			foreach (Server server in servers)
 			{
-				if ((UnityEngine.Object)(object)port != (UnityEngine.Object)null && port.cableIDsOnLink > 0)
-					liveCableCount++;
+				if ((UnityEngine.Object)(object)server == (UnityEngine.Object)null || server.cablelinks == null || !IsPlacedRackObject((Component)(object)server))
+					continue;
+				int rackPositionUid = GetRackPositionUid((Component)(object)server);
+				if (rackPositionUid <= 0)
+					continue;
+				parts.Add($"S:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)server.cablelinks).Length}");
+				foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)server.cablelinks)
+				{
+					if ((UnityEngine.Object)(object)port != (UnityEngine.Object)null && port.cableIDsOnLink > 0)
+						liveCableCount++;
+				}
 			}
 		}
-		foreach (NetworkSwitch networkSwitch in UnityEngine.Object.FindObjectsOfType<NetworkSwitch>())
+		if (switches != null)
 		{
-			if ((UnityEngine.Object)(object)networkSwitch == (UnityEngine.Object)null || networkSwitch.cableLinkSwitchPorts == null || !IsPlacedRackObject((Component)(object)networkSwitch))
-				continue;
-			int rackPositionUid = GetRackPositionUid((Component)(object)networkSwitch);
-			if (rackPositionUid <= 0)
-				continue;
-			parts.Add($"W:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)networkSwitch.cableLinkSwitchPorts).Length}");
+			foreach (NetworkSwitch networkSwitch in switches)
+			{
+				if ((UnityEngine.Object)(object)networkSwitch == (UnityEngine.Object)null || networkSwitch.cableLinkSwitchPorts == null || !IsPlacedRackObject((Component)(object)networkSwitch))
+					continue;
+				int rackPositionUid2 = GetRackPositionUid((Component)(object)networkSwitch);
+				if (rackPositionUid2 <= 0)
+					continue;
+				parts.Add($"W:{rackPositionUid2}:{((Il2CppArrayBase<CableLink>)(object)networkSwitch.cableLinkSwitchPorts).Length}");
+			}
 		}
-		foreach (PatchPanel patchPanel in UnityEngine.Object.FindObjectsOfType<PatchPanel>())
+		if (panels != null)
 		{
-			if ((UnityEngine.Object)(object)patchPanel == (UnityEngine.Object)null || patchPanel.cableLinkPorts == null || !IsPlacedRackObject((Component)(object)patchPanel))
-				continue;
-			int rackPositionUid = GetRackPositionUid((Component)(object)patchPanel);
-			if (rackPositionUid <= 0)
-				continue;
-			parts.Add($"P:{rackPositionUid}:{((Il2CppArrayBase<CableLink>)(object)patchPanel.cableLinkPorts).Length}");
+			foreach (PatchPanel patchPanel in panels)
+			{
+				if ((UnityEngine.Object)(object)patchPanel == (UnityEngine.Object)null || patchPanel.cableLinkPorts == null || !IsPlacedRackObject((Component)(object)patchPanel))
+					continue;
+				int rackPositionUid3 = GetRackPositionUid((Component)(object)patchPanel);
+				if (rackPositionUid3 <= 0)
+					continue;
+				parts.Add($"P:{rackPositionUid3}:{((Il2CppArrayBase<CableLink>)(object)patchPanel.cableLinkPorts).Length}");
+			}
 		}
 		parts.Sort(StringComparer.Ordinal);
-		fingerprint = string.Join("|", parts);
+		return string.Join("|", parts);
+	}
+
+	private static bool TryBuildLiveTopologySnapshot(out string fingerprint, out int liveCableCount)
+	{
+		fingerprint = BuildTopologyFingerprintFromSnapshots(UnityEngine.Object.FindObjectsOfType<Server>(), UnityEngine.Object.FindObjectsOfType<NetworkSwitch>(), UnityEngine.Object.FindObjectsOfType<PatchPanel>(), out liveCableCount);
 		return true;
 	}
 
@@ -814,6 +1035,13 @@ public class RackBuilderCore : MelonMod
 		return liveCableCount;
 	}
 
+	private static bool HasRackBuilderManagedPrefix(string id)
+	{
+		return !string.IsNullOrEmpty(id)
+			&& (id.StartsWith("Mod_", StringComparison.Ordinal)
+				|| id.StartsWith("Build_", StringComparison.Ordinal));
+	}
+
 	private bool ShouldRestoreFromSavedTopology(out int expectedCableCount, out int liveCableCount)
 	{
 		expectedCableCount = 0;
@@ -827,11 +1055,29 @@ public class RackBuilderCore : MelonMod
 			CableTopologyData topology = JsonSerializer.Deserialize<CableTopologyData>(json);
 			if (topology == null || topology.Cables == null || topology.Cables.Count == 0)
 				return false;
-			if (!TryBuildLiveTopologySnapshot(out string currentFingerprint, out liveCableCount))
-				return false;
-			if (!string.IsNullOrEmpty(topology.LayoutFingerprint) && !string.Equals(topology.LayoutFingerprint, currentFingerprint, StringComparison.Ordinal))
+			string currentFingerprint = BuildTopologyFingerprintFromSnapshots(GetServerSnapshot(), GetNetworkSwitchSnapshot(), GetPatchPanelSnapshot(), out liveCableCount);
+			if (string.IsNullOrEmpty(currentFingerprint))
 				return false;
 			expectedCableCount = topology.Cables.Count;
+			if (!string.IsNullOrEmpty(topology.LayoutFingerprint) && !string.Equals(topology.LayoutFingerprint, currentFingerprint, StringComparison.Ordinal))
+			{
+				HashSet<string> hashSet = GetServerSnapshot()
+					.Where((Server s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && IsPlacedRackObject((Component)(object)s) && HasRackBuilderManagedPrefix(s.ServerID))
+					.Select((Server s) => s.ServerID)
+					.Where((string id) => !string.IsNullOrEmpty(id))
+					.ToHashSet(StringComparer.Ordinal);
+				int num = topology.Cables.Count((CableLinkData c) => !string.IsNullOrEmpty(c.ServerID) && hashSet.Contains(c.ServerID));
+				if (num <= 0)
+				{
+					return false;
+				}
+				if (liveCableCount < expectedCableCount)
+				{
+					((MelonBase)this).LoggerInstance.Warning($"[RackBuilder] Layout fingerprint drift detected, but {num} saved server IDs still match current rack objects. Attempting restore (live={liveCableCount}, expected={expectedCableCount}).");
+					return true;
+				}
+				return false;
+			}
 			return liveCableCount < expectedCableCount;
 		}
 		catch (Exception ex)
@@ -846,6 +1092,11 @@ public class RackBuilderCore : MelonMod
 		return Path.Combine(UnityEngine.Application.persistentDataPath, "RackRoles.json");
 	}
 
+	private static string GetRackProfilesFilePath()
+	{
+		return Path.Combine(UnityEngine.Application.persistentDataPath, "RackProfiles.json");
+	}
+
 	private string BuildRackRoleKey(Rack rack)
 	{
 		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || rack.positions == null)
@@ -858,10 +1109,162 @@ public class RackBuilderCore : MelonMod
 			if (rp.rackPosGlobalUID > 0)
 				uids.Add(rp.rackPosGlobalUID);
 		}
-		if (uids.Count == 0)
-			return "";
-		uids.Sort();
-		return string.Join("-", uids);
+		if (uids.Count > 0)
+		{
+			uids.Sort();
+			// Preserve legacy key format when UIDs exist so existing RackRoles.json entries remain valid.
+			return string.Join("-", uids);
+		}
+
+		List<string> slotPositionKeys = new List<string>();
+		foreach (RackPosition rp2 in (Il2CppArrayBase<RackPosition>)(object)rack.positions)
+		{
+			if ((UnityEngine.Object)(object)rp2 == (UnityEngine.Object)null)
+				continue;
+			Vector3 position = ((Component)(object)rp2).transform.position;
+			int x = Mathf.RoundToInt(position.x * 100f);
+			int y = Mathf.RoundToInt(position.y * 100f);
+			int z = Mathf.RoundToInt(position.z * 100f);
+			slotPositionKeys.Add($"{x}:{y}:{z}");
+		}
+		if (slotPositionKeys.Count > 0)
+		{
+			slotPositionKeys.Sort(StringComparer.Ordinal);
+			return "pos:" + string.Join("|", slotPositionKeys);
+		}
+
+		Vector3 rackPos = ((Component)(object)rack).transform.position;
+		int rackX = Mathf.RoundToInt(rackPos.x * 100f);
+		int rackY = Mathf.RoundToInt(rackPos.y * 100f);
+		int rackZ = Mathf.RoundToInt(rackPos.z * 100f);
+		return $"rack:{rackX}:{rackY}:{rackZ}";
+	}
+
+	private void SetReturnButtonsInputEnabled(bool enabled)
+	{
+		foreach (ButtonExtended returnButton in _rackReturnButtons)
+		{
+			if ((UnityEngine.Object)(object)returnButton == (UnityEngine.Object)null)
+				continue;
+			((Behaviour)(object)returnButton).enabled = enabled;
+			((Selectable)(object)returnButton).interactable = enabled;
+		}
+	}
+
+	private void SetProfileDialogInputIsolation(bool enabled)
+	{
+		SetReturnButtonsInputEnabled(!enabled);
+
+		if (enabled)
+		{
+			if (_profileDialogSuppressedButtons.Count == 0)
+			{
+				_profileDialogSuppressedButtons.Clear();
+				_profileDialogSuppressedButtonEnabled.Clear();
+				_profileDialogSuppressedButtonInteractable.Clear();
+
+				foreach (ButtonExtended buttonExtended in UnityEngine.Object.FindObjectsOfType<ButtonExtended>())
+				{
+					if ((UnityEngine.Object)(object)buttonExtended == (UnityEngine.Object)null)
+						continue;
+					int id = ((UnityEngine.Object)(object)buttonExtended).GetInstanceID();
+					if (_profileDialogSuppressedButtonEnabled.ContainsKey(id))
+						continue;
+					_profileDialogSuppressedButtonEnabled[id] = ((Behaviour)(object)buttonExtended).enabled;
+					_profileDialogSuppressedButtonInteractable[id] = ((Selectable)(object)buttonExtended).interactable;
+					((Behaviour)(object)buttonExtended).enabled = false;
+					((Selectable)(object)buttonExtended).interactable = false;
+					_profileDialogSuppressedButtons.Add(buttonExtended);
+				}
+			}
+		}
+		else if (_profileDialogSuppressedButtons.Count > 0)
+		{
+			foreach (ButtonExtended buttonExtended in _profileDialogSuppressedButtons)
+			{
+				if ((UnityEngine.Object)(object)buttonExtended == (UnityEngine.Object)null)
+					continue;
+				int id = ((UnityEngine.Object)(object)buttonExtended).GetInstanceID();
+				if (_profileDialogSuppressedButtonEnabled.TryGetValue(id, out bool wasEnabled))
+					((Behaviour)(object)buttonExtended).enabled = wasEnabled;
+				if (_profileDialogSuppressedButtonInteractable.TryGetValue(id, out bool wasInteractable))
+					((Selectable)(object)buttonExtended).interactable = wasInteractable;
+			}
+			_profileDialogSuppressedButtons.Clear();
+			_profileDialogSuppressedButtonEnabled.Clear();
+			_profileDialogSuppressedButtonInteractable.Clear();
+		}
+
+		if (_profileDialogSuppressesShopInput != enabled)
+		{
+			_profileDialogSuppressesShopInput = enabled;
+			if ((UnityEngine.Object)(object)_shop != (UnityEngine.Object)null)
+			{
+				try
+				{
+					((Behaviour)(object)_shop).enabled = !enabled;
+				}
+				catch
+				{
+				}
+			}
+		}
+
+		EventSystem current = EventSystem.current;
+		if ((UnityEngine.Object)(object)current == (UnityEngine.Object)null)
+			return;
+
+		if (enabled)
+		{
+			if (!_profileDialogHasSavedSendNavigationEvents)
+			{
+				_profileDialogSavedSendNavigationEvents = current.sendNavigationEvents;
+				_profileDialogHasSavedSendNavigationEvents = true;
+			}
+			current.sendNavigationEvents = false;
+		}
+		else if (_profileDialogHasSavedSendNavigationEvents)
+		{
+			current.sendNavigationEvents = _profileDialogSavedSendNavigationEvents;
+			_profileDialogHasSavedSendNavigationEvents = false;
+		}
+	}
+
+	private void EnforceProfileNameDialogModalState()
+	{
+		if (_profileNameDialogShouldRemainOpen && !_profileNameDialogActive)
+		{
+			_profileNameDialogActive = true;
+		}
+
+		if (!_profileNameDialogActive)
+			return;
+
+		SetProfileDialogInputIsolation(true);
+
+		if ((UnityEngine.Object)(object)_shop != (UnityEngine.Object)null && (UnityEngine.Object)(object)_shop.mainScreen != (UnityEngine.Object)null && _shop.mainScreen.activeSelf)
+			_shop.mainScreen.SetActive(false);
+
+		if ((UnityEngine.Object)(object)_rackScreen != (UnityEngine.Object)null && !_rackScreen.activeSelf)
+			_rackScreen.SetActive(true);
+
+		if ((UnityEngine.Object)(object)_profileNameDialogInput == (UnityEngine.Object)null)
+		{
+			ShowProfileNameDialog();
+			return;
+		}
+
+		EventSystem current = EventSystem.current;
+		if ((UnityEngine.Object)(object)current != (UnityEngine.Object)null)
+		{
+			GameObject inputGo = ((Component)(object)_profileNameDialogInput).gameObject;
+			if ((UnityEngine.Object)(object)current.currentSelectedGameObject != (UnityEngine.Object)(object)inputGo)
+			{
+				current.SetSelectedGameObject(inputGo);
+				_profileNameDialogInput.ActivateInputField();
+				_profileNameDialogInput.Select();
+			}
+		}
 	}
 
 	private void EnsureRackRolesLoaded()
@@ -904,13 +1307,772 @@ public class RackBuilderCore : MelonMod
 			{
 				data.Racks.Add(new RackRoleEntry { RackKey = kv.Key, Role = kv.Value });
 			}
-			string json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
+			string json = JsonSerializer.Serialize(data, IndentedJsonOptions);
 			File.WriteAllText(GetRackRolesFilePath(), json);
 		}
 		catch (Exception ex)
 		{
 			((MelonBase)this).LoggerInstance.Warning("Failed to save rack roles: " + ex.Message);
 		}
+	}
+
+	private void EnsureRackProfilesLoaded()
+	{
+		if (_rackProfilesLoaded)
+			return;
+		_rackProfilesLoaded = true;
+		_rackProfilesByName.Clear();
+		try
+		{
+			string path = GetRackProfilesFilePath();
+			if (!File.Exists(path))
+				return;
+			string json = File.ReadAllText(path);
+			RackProfileData data = JsonSerializer.Deserialize<RackProfileData>(json);
+			if (data?.Profiles == null)
+				return;
+			foreach (RackProfileEntry entry in data.Profiles)
+			{
+				if (entry == null || string.IsNullOrEmpty(entry.Name) || entry.Items == null)
+					continue;
+				_rackProfilesByName[entry.Name] = entry;
+			}
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Failed to load rack profiles: " + ex.Message);
+		}
+	}
+
+	private void SaveRackProfiles()
+	{
+		try
+		{
+			RackProfileData data = new RackProfileData();
+			foreach (RackProfileEntry entry in _rackProfilesByName.Values.OrderByDescending((RackProfileEntry p) => p.CreatedUtc ?? ""))
+			{
+				data.Profiles.Add(entry);
+			}
+			string json = JsonSerializer.Serialize(data, IndentedJsonOptions);
+			File.WriteAllText(GetRackProfilesFilePath(), json);
+		}
+		catch (Exception ex)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Failed to save rack profiles: " + ex.Message);
+		}
+	}
+
+	private static string BuildProfileItemKey(string category, int prefabIndex)
+	{
+		return (category ?? "") + ":" + prefabIndex;
+	}
+
+	private static string BuildNewProfileName()
+	{
+		return "Profile " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+	}
+
+	private static string SanitizeProfileName(string rawName)
+	{
+		if (string.IsNullOrEmpty(rawName))
+		{
+			return "";
+		}
+		string text = rawName.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
+		while (text.Contains("  "))
+		{
+			text = text.Replace("  ", " ");
+		}
+		if (text.Length > 64)
+		{
+			text = text.Substring(0, 64).Trim();
+		}
+		return text;
+	}
+
+	private string BuildUniqueProfileName(string requestedName)
+	{
+		string text = SanitizeProfileName(requestedName);
+		if (string.IsNullOrEmpty(text))
+		{
+			text = BuildNewProfileName();
+		}
+		if (!_rackProfilesByName.ContainsKey(text))
+		{
+			return text;
+		}
+		for (int i = 2; i <= 999; i++)
+		{
+			string text2 = $"{text} ({i})";
+			if (!_rackProfilesByName.ContainsKey(text2))
+			{
+				return text2;
+			}
+		}
+		return text + " (copy)";
+	}
+
+	private bool TryGetRackOrientationTopHigh(Rack rack, out bool topIsHigh, out int slotCount)
+	{
+		topIsHigh = false;
+		slotCount = (rack != null && rack.positions != null) ? ((Il2CppArrayBase<RackPosition>)(object)rack.positions).Length : 0;
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || rack.positions == null || slotCount < 2)
+			return false;
+		RackPosition rpA = ((Il2CppArrayBase<RackPosition>)(object)rack.positions)[0];
+		RackPosition rpB = ((Il2CppArrayBase<RackPosition>)(object)rack.positions)[slotCount - 1];
+		if ((UnityEngine.Object)(object)rpA == (UnityEngine.Object)null || (UnityEngine.Object)(object)rpB == (UnityEngine.Object)null)
+			return false;
+		topIsHigh = ((Component)rpB).transform.position.y > ((Component)rpA).transform.position.y;
+		return true;
+	}
+
+	private List<RackProfileItemEntry> BuildRackProfileItems(Rack rack)
+	{
+		List<RackProfileItemEntry> items = new List<RackProfileItemEntry>();
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || rack.positions == null)
+			return items;
+
+		Dictionary<int, int> rpInstanceToSlot = new Dictionary<int, int>();
+		Dictionary<int, int> rpUidToSlot = new Dictionary<int, int>();
+		for (int i = 0; i < ((Il2CppArrayBase<RackPosition>)(object)rack.positions).Length; i++)
+		{
+			RackPosition rp = ((Il2CppArrayBase<RackPosition>)(object)rack.positions)[i];
+			if ((UnityEngine.Object)(object)rp == (UnityEngine.Object)null)
+				continue;
+			rpInstanceToSlot[((Component)rp).gameObject.GetInstanceID()] = i;
+			if (rp.rackPosGlobalUID > 0)
+				rpUidToSlot[rp.rackPosGlobalUID] = i;
+		}
+
+		HashSet<int> seenAnchors = new HashSet<int>();
+		foreach (UsableObject uo in CollectRackUsableObjects(rack))
+		{
+			if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null)
+				continue;
+			if ((UnityEngine.Object)(object)((Component)uo).GetComponent<SFPModule>() != (UnityEngine.Object)null)
+				continue;
+			int anchor = -1;
+			if ((UnityEngine.Object)(object)uo.currentRackPosition != (UnityEngine.Object)null)
+				rpInstanceToSlot.TryGetValue(((Component)uo.currentRackPosition).gameObject.GetInstanceID(), out anchor);
+			if (anchor < 0 && uo.rackPositionUID > 0)
+				rpUidToSlot.TryGetValue(uo.rackPositionUID, out anchor);
+			if (anchor < 0)
+				anchor = uo.storedPosition;
+			if (anchor < 0 || anchor >= ((Il2CppArrayBase<RackPosition>)(object)rack.positions).Length)
+				continue;
+			if (!seenAnchors.Add(anchor))
+				continue;
+
+			string category = null;
+			int prefabIndex = -1;
+			Server srv = ((Component)uo).GetComponent<Server>() ?? ((Component)uo).GetComponentInChildren<Server>();
+			if ((UnityEngine.Object)(object)srv != (UnityEngine.Object)null)
+			{
+				category = "server";
+				prefabIndex = srv.serverType;
+			}
+			else
+			{
+				NetworkSwitch sw = ((Component)uo).GetComponent<NetworkSwitch>() ?? ((Component)uo).GetComponentInChildren<NetworkSwitch>();
+				if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null)
+				{
+					category = "switch";
+					prefabIndex = sw.switchType;
+				}
+				else
+				{
+					PatchPanel pp = ((Component)uo).GetComponent<PatchPanel>() ?? ((Component)uo).GetComponentInChildren<PatchPanel>();
+					if ((UnityEngine.Object)(object)pp != (UnityEngine.Object)null)
+					{
+						category = "patchpanel";
+						prefabIndex = pp.patchPanelType;
+					}
+				}
+			}
+			if (string.IsNullOrEmpty(category) || prefabIndex < 0)
+				continue;
+
+			items.Add(new RackProfileItemEntry
+			{
+				Category = category,
+				PrefabIndex = prefabIndex,
+				SizeInU = (uo.sizeInU > 0) ? uo.sizeInU : 1,
+				AnchorSlot = anchor
+			});
+		}
+
+		items.Sort((RackProfileItemEntry a, RackProfileItemEntry b) => b.AnchorSlot.CompareTo(a.AnchorSlot));
+		return items;
+	}
+
+	private void SaveSelectedRackAsProfile(string requestedName = "", bool refreshUi = true)
+	{
+		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
+			return;
+		EnsureRackProfilesLoaded();
+		List<RackProfileItemEntry> items = BuildRackProfileItems(_selectedRack);
+		if (items.Count == 0)
+		{
+			((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Profile save skipped: selected rack has no equipment.");
+			if (refreshUi)
+			{
+				ShowRackDetail();
+			}
+			return;
+		}
+		string baseName = string.IsNullOrEmpty(requestedName) ? BuildNewProfileName() : requestedName;
+		string finalName = BuildUniqueProfileName(baseName);
+		RackProfileEntry profile = new RackProfileEntry();
+		profile.Name = finalName;
+		profile.CreatedUtc = DateTime.UtcNow.ToString("o");
+		profile.RackUnits = (_selectedRack.positions != null) ? ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions).Length : 0;
+		profile.RackRole = GetRackRole(_selectedRack);
+		profile.Items = items;
+		_rackProfilesByName[profile.Name] = profile;
+		SaveRackProfiles();
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Saved profile '{profile.Name}' with {profile.Items.Count} items.");
+		if (refreshUi)
+		{
+			ShowRackDetail();
+		}
+	}
+
+	private bool RenameProfile(string currentName, string requestedName)
+	{
+		EnsureRackProfilesLoaded();
+		if (string.IsNullOrEmpty(currentName) || !_rackProfilesByName.TryGetValue(currentName, out RackProfileEntry profile) || profile == null)
+		{
+			return false;
+		}
+		string finalName = BuildUniqueProfileName(requestedName);
+		if (string.Equals(finalName, currentName, StringComparison.OrdinalIgnoreCase))
+		{
+			return false;
+		}
+		_rackProfilesByName.Remove(currentName);
+		profile.Name = finalName;
+		_rackProfilesByName[finalName] = profile;
+		if (string.Equals(_armedProfileName, currentName, StringComparison.OrdinalIgnoreCase))
+		{
+			_armedProfileName = finalName;
+		}
+		SaveRackProfiles();
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Renamed profile '{currentName}' to '{finalName}'.");
+		return true;
+	}
+
+	private IEnumerator FocusProfileNameInputDeferred(InputField inputField)
+	{
+		yield return null;
+		if ((UnityEngine.Object)(object)inputField == (UnityEngine.Object)null)
+		{
+			yield break;
+		}
+		EventSystem current = EventSystem.current;
+		if ((UnityEngine.Object)(object)current != (UnityEngine.Object)null)
+		{
+			current.SetSelectedGameObject(((Component)inputField).gameObject);
+		}
+		inputField.ActivateInputField();
+		inputField.Select();
+	}
+
+	private Font GetProfileNameInputFont()
+	{
+		if ((UnityEngine.Object)(object)_profileNameInputFont == (UnityEngine.Object)null)
+		{
+			_profileNameInputFont = Resources.GetBuiltinResource<Font>("Arial.ttf");
+		}
+		return _profileNameInputFont;
+	}
+
+	private InputField AddProfileNameInputRow(string initialValue)
+	{
+		GameObject val = new GameObject("ProfileNameInputRow");
+		RectTransform val2 = val.AddComponent<RectTransform>();
+		val.transform.SetParent(_contentParent, false);
+		((Transform)(object)val2).localScale = Vector3.one;
+		val2.sizeDelta = new Vector2(0f, 40f);
+		LayoutElement val3 = val.AddComponent<LayoutElement>();
+		val3.preferredHeight = 40f;
+		val3.minHeight = 40f;
+		Image val4 = val.AddComponent<Image>();
+		((Graphic)val4).color = new Color(0.08f, 0.08f, 0.1f, 0.95f);
+		Font builtinResource = GetProfileNameInputFont();
+
+		GameObject val5 = new GameObject("NameText");
+		RectTransform val6 = val5.AddComponent<RectTransform>();
+		val5.transform.SetParent(val.transform, false);
+		val6.anchorMin = new Vector2(0f, 0f);
+		val6.anchorMax = new Vector2(1f, 1f);
+		val6.offsetMin = new Vector2(10f, 4f);
+		val6.offsetMax = new Vector2(-10f, -4f);
+		Text val7 = val5.AddComponent<Text>();
+		val7.font = builtinResource;
+		val7.fontSize = 16;
+		val7.alignment = (TextAnchor)3;
+		((Graphic)val7).color = Color.white;
+		val7.supportRichText = false;
+
+		GameObject val8 = new GameObject("Placeholder");
+		RectTransform val9 = val8.AddComponent<RectTransform>();
+		val8.transform.SetParent(val.transform, false);
+		val9.anchorMin = new Vector2(0f, 0f);
+		val9.anchorMax = new Vector2(1f, 1f);
+		val9.offsetMin = new Vector2(10f, 4f);
+		val9.offsetMax = new Vector2(-10f, -4f);
+		Text val10 = val8.AddComponent<Text>();
+		val10.font = builtinResource;
+		val10.fontSize = 16;
+		val10.alignment = (TextAnchor)3;
+		((Graphic)val10).color = new Color(0.65f, 0.68f, 0.75f, 0.9f);
+		val10.text = "Enter profile name...";
+
+		InputField val11 = val.AddComponent<InputField>();
+		val11.textComponent = val7;
+		val11.placeholder = (Graphic)(object)val10;
+		val11.characterLimit = 64;
+		val11.readOnly = false;
+		val11.lineType = (InputField.LineType)0;
+		val11.text = SanitizeProfileName(initialValue);
+		_uiRows.Add(val);
+		return val11;
+	}
+
+	private void SubmitProfileNameDialog()
+	{
+		string text = SanitizeProfileName((_profileNameDialogInput != null) ? _profileNameDialogInput.text : _profileNameDialogInitialValue);
+		if (string.IsNullOrEmpty(text))
+		{
+			((MelonBase)this).LoggerInstance.Warning("[RackBuilder] Profile name cannot be empty.");
+			return;
+		}
+		Action<string> profileNameDialogConfirmAction = _profileNameDialogConfirmAction;
+		bool profileNameDialogReturnToDetail = _profileNameDialogReturnToDetail;
+		_profileNameDialogShouldRemainOpen = false;
+		_profileNameDialogActive = false;
+		_profileNameDialogTitle = null;
+		_profileNameDialogInitialValue = null;
+		_profileNameDialogInput = null;
+		_profileNameDialogConfirmAction = null;
+		SetProfileDialogInputIsolation(false);
+		profileNameDialogConfirmAction?.Invoke(text);
+		if (profileNameDialogReturnToDetail)
+		{
+			ShowRackDetail();
+		}
+		else
+		{
+			ShowRackList();
+		}
+	}
+
+	private void CloseProfileNameDialog()
+	{
+		bool profileNameDialogReturnToDetail = _profileNameDialogReturnToDetail;
+		_profileNameDialogShouldRemainOpen = false;
+		_profileNameDialogActive = false;
+		_profileNameDialogTitle = null;
+		_profileNameDialogInitialValue = null;
+		_profileNameDialogInput = null;
+		_profileNameDialogConfirmAction = null;
+		SetProfileDialogInputIsolation(false);
+		if (profileNameDialogReturnToDetail)
+		{
+			ShowRackDetail();
+		}
+		else
+		{
+			ShowRackList();
+		}
+	}
+
+	private void ShowProfileNameDialog()
+	{
+		if (!_profileNameDialogActive)
+		{
+			return;
+		}
+		if ((UnityEngine.Object)(object)_profileNameDialogInput != (UnityEngine.Object)null)
+		{
+			_profileNameDialogInput.ActivateInputField();
+			return;
+		}
+		ClearContent();
+		AddTitle(string.IsNullOrEmpty(_profileNameDialogTitle) ? "Profile Name" : _profileNameDialogTitle);
+		AddSpacer();
+		AddColorLabel("  Type a custom profile name and confirm.", new Color(0.85f, 0.85f, 0.95f));
+		_profileNameDialogInput = AddProfileNameInputRow(_profileNameDialogInitialValue);
+		MelonCoroutines.Start(FocusProfileNameInputDeferred(_profileNameDialogInput));
+		AddSpacer();
+		AddClickableRow("  SAVE NAME", new Color(0.16f, 0.36f, 0.18f), delegate
+		{
+			SubmitProfileNameDialog();
+		});
+		AddClickableRow("  CANCEL", new Color(0.28f, 0.18f, 0.18f), delegate
+		{
+			CloseProfileNameDialog();
+		});
+	}
+
+	private void OpenProfileNameDialog(string title, string initialValue, bool returnToDetail, Action<string> onConfirm)
+	{
+		_profileNameDialogShouldRemainOpen = true;
+		_profileNameDialogActive = true;
+		_profileNameDialogReturnToDetail = returnToDetail;
+		_profileNameDialogTitle = title;
+		_profileNameDialogInitialValue = SanitizeProfileName(initialValue);
+		_profileNameDialogInput = null;
+		_profileNameDialogConfirmAction = onConfirm;
+		SetProfileDialogInputIsolation(true);
+		ShowProfileNameDialog();
+	}
+
+	private bool InstallItemChoiceAtSlot(ItemChoice itemChoice, int slotIndex, MainGameManager mgr, bool topIsHigh, int slotCount)
+	{
+		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null || _selectedRack.positions == null)
+			return false;
+		if ((UnityEngine.Object)(object)mgr == (UnityEngine.Object)null)
+			return false;
+		if (slotIndex < 0 || slotIndex + itemChoice.sizeInU > slotCount)
+			return false;
+		if (!_selectedRack.IsPositionAvailable(slotIndex, itemChoice.sizeInU))
+			return false;
+
+		int anchorPosIndex = topIsHigh ? (slotIndex + itemChoice.sizeInU - 1) : slotIndex;
+		RackPosition rp = ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions)[anchorPosIndex];
+		if ((UnityEngine.Object)(object)rp == (UnityEngine.Object)null)
+			return false;
+
+		if (rp.rackPosGlobalUID <= 0)
+		{
+			mgr.lastUsedRackPositionGlobalUID++;
+			rp.rackPosGlobalUID = mgr.lastUsedRackPositionGlobalUID;
+		}
+
+		try
+		{
+			GameObject prefab = null;
+			switch (itemChoice.category)
+			{
+				case "server":
+					prefab = mgr.GetServerPrefab(itemChoice.prefabIndex);
+					break;
+				case "switch":
+					prefab = mgr.GetSwitchPrefab(itemChoice.prefabIndex);
+					break;
+				case "patchpanel":
+					prefab = mgr.GetPatchPanelPrefab(itemChoice.prefabIndex);
+					break;
+			}
+			if ((UnityEngine.Object)(object)prefab == (UnityEngine.Object)null)
+				return false;
+
+			GameObject go = UnityEngine.Object.Instantiate<GameObject>(prefab, mgr.parentUsableObjects);
+			if (itemChoice.category == "server" || itemChoice.category == "switch")
+			{
+				foreach (CableLink cl in go.GetComponentsInChildren<CableLink>(true))
+					if ((UnityEngine.Object)(object)cl != (UnityEngine.Object)null)
+						cl.cableIDsOnLink = -1;
+			}
+
+			UsableObject uo = go.GetComponent<UsableObject>() ?? go.GetComponentInChildren<UsableObject>(true);
+			Vector3 secondPos = Vector3.zero;
+			Quaternion secondRot = Quaternion.identity;
+			if ((UnityEngine.Object)(object)uo != (UnityEngine.Object)null)
+			{
+				secondPos = uo.secondPosition;
+				secondRot = Quaternion.Euler(uo.secondRotation);
+			}
+
+			go.transform.SetParent(((Component)rp).transform);
+			go.transform.localPosition = secondPos;
+			go.transform.localRotation = secondRot;
+
+			Rigidbody rb = go.GetComponent<Rigidbody>();
+			if ((UnityEngine.Object)(object)rb != (UnityEngine.Object)null)
+			{
+				rb.isKinematic = true;
+				rb.useGravity = false;
+				rb.velocity = Vector3.zero;
+				rb.angularVelocity = Vector3.zero;
+			}
+
+			if ((UnityEngine.Object)(object)uo != (UnityEngine.Object)null)
+			{
+				uo.currentRackPosition = rp;
+				uo.rackPositionUID = rp.rackPosGlobalUID;
+				uo.objectInHands = false;
+				uo.isDropAllowed = true;
+				uo.isOnTrolley = false;
+				uo.keepUpright = false;
+				uo.storedPosition = slotIndex;
+				uo.sizeInU = itemChoice.sizeInU;
+				mgr.lastUsedRackPositionGlobalUID++;
+				((Interact)uo).uid = mgr.lastUsedRackPositionGlobalUID;
+			}
+
+			Server srv = go.GetComponent<Server>() ?? go.GetComponentInChildren<Server>(true);
+			if ((UnityEngine.Object)(object)srv != (UnityEngine.Object)null)
+			{
+				srv.ServerID = "Mod_" + Guid.NewGuid().ToString().Substring(0, 8);
+				srv.serverType = itemChoice.prefabIndex;
+				((UsableObject)srv).prefabID = itemChoice.prefabIndex;
+				if (srv.activeLinks != null)
+					srv.activeLinks.Clear();
+				if (srv.cablelinks != null)
+				{
+					foreach (CableLink cl2 in (Il2CppArrayBase<CableLink>)(object)srv.cablelinks)
+						if ((UnityEngine.Object)(object)cl2 != (UnityEngine.Object)null)
+						{
+							cl2.cableIDsOnLink = -1;
+							cl2.parentServer = srv;
+						}
+				}
+			}
+
+			NetworkSwitch sw = go.GetComponent<NetworkSwitch>() ?? go.GetComponentInChildren<NetworkSwitch>(true);
+			if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null)
+			{
+				sw.switchId = "Mod_" + Guid.NewGuid().ToString().Substring(0, 8);
+				sw.switchType = itemChoice.prefabIndex;
+				if (sw.cableLinkSwitchPorts != null)
+				{
+					foreach (CableLink cl3 in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
+						if ((UnityEngine.Object)(object)cl3 != (UnityEngine.Object)null)
+						{
+							cl3.cableIDsOnLink = -1;
+							cl3.switchID = sw.switchId;
+							cl3.parentSwitch = sw;
+						}
+				}
+				sw.temporarilyDisconnectedCables = new Il2CppSystem.Collections.Generic.HashSet<int>();
+			}
+
+			PatchPanel pp = go.GetComponent<PatchPanel>() ?? go.GetComponentInChildren<PatchPanel>(true);
+			if ((UnityEngine.Object)(object)pp != (UnityEngine.Object)null)
+			{
+				pp.patchPanelId = "Mod_" + Guid.NewGuid().ToString().Substring(0, 8);
+				pp.patchPanelType = itemChoice.prefabIndex;
+				((UsableObject)pp).prefabID = itemChoice.prefabIndex;
+			}
+
+			try
+			{
+				bool scrubServerOrSwitchCables = false;
+				if ((UnityEngine.Object)(object)srv != (UnityEngine.Object)null)
+				{
+					int timeToBrake = (srv.timeToBrake > 0) ? srv.timeToBrake : 99999;
+					int eolTime = (srv.eolTime > 0) ? srv.eolTime : 99999;
+					srv.timeToBrake = timeToBrake;
+					srv.eolTime = eolTime;
+					srv.isBroken = false;
+					srv.isWarningCleared = true;
+					ServerSaveData ssd = new ServerSaveData();
+					ssd.serverID = srv.ServerID;
+					ssd.serverType = srv.serverType;
+					ssd.prefabID = ((UsableObject)srv).prefabID;
+					ssd.rackPositionUID = rp.rackPosGlobalUID;
+					ssd.position = go.transform.position;
+					ssd.rotation = go.transform.rotation;
+					ssd.customerID = 0;
+					ssd.ip = "";
+					ssd.isOn = false;
+					ssd.isBroken = false;
+					ssd.isWarningCleared = true;
+					ssd.timeToBrake = timeToBrake;
+					ssd.eolTime = eolTime;
+					try { srv.Start(); } catch { }
+					srv.ServerInsertedInRack(ssd);
+					srv.isOn = false;
+					if (srv.activeLinks != null)
+						srv.activeLinks.Clear();
+					scrubServerOrSwitchCables = true;
+				}
+				if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null)
+				{
+					int timeToBrake2 = (sw.timeToBrake > 0) ? sw.timeToBrake : 99999;
+					int eolTime2 = (sw.eolTime > 0) ? sw.eolTime : 99999;
+					sw.timeToBrake = timeToBrake2;
+					sw.eolTime = eolTime2;
+					sw.isBroken = false;
+					sw.isWarningCleared = true;
+					SwitchSaveData swsd = new SwitchSaveData();
+					swsd.switchID = sw.switchId;
+					swsd.switchType = sw.switchType;
+					swsd.rackPositionUID = rp.rackPosGlobalUID;
+					swsd.position = go.transform.position;
+					swsd.rotation = go.transform.rotation;
+					swsd.isOn = false;
+					swsd.label = "";
+					swsd.isBroken = false;
+					swsd.isWarningCleared = true;
+					swsd.timeToBrake = timeToBrake2;
+					swsd.eolTime = eolTime2;
+					sw.SwitchInsertedInRack(swsd);
+					sw.isOn = false;
+					if (sw.cableLinkSwitchPorts != null)
+					{
+						foreach (CableLink sfpCl in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
+							if ((UnityEngine.Object)(object)sfpCl != (UnityEngine.Object)null && sfpCl.isSFPPort
+								&& (UnityEngine.Object)(object)sfpCl.insertedSFP == (UnityEngine.Object)null)
+								sfpCl.connectionSpeed = 0f;
+					}
+					scrubServerOrSwitchCables = true;
+				}
+				if ((UnityEngine.Object)(object)pp != (UnityEngine.Object)null)
+				{
+					PatchPanelSaveData ppsd = new PatchPanelSaveData();
+					ppsd.patchPanelID = pp.patchPanelId;
+					ppsd.patchPanelType = pp.patchPanelType;
+					ppsd.rackPositionUID = rp.rackPosGlobalUID;
+					ppsd.position = go.transform.position;
+					ppsd.rotation = go.transform.rotation;
+					pp.InsertedInRack(ppsd);
+				}
+				if (scrubServerOrSwitchCables)
+				{
+					MelonCoroutines.Start(ScrubPlacedDeviceCableIds(go, 45));
+					SanitizeGhostCableIDs();
+				}
+			}
+			catch (Exception ex)
+			{
+				((MelonBase)this).LoggerInstance.Warning("InsertedInRack finalizer failed for " + itemChoice.name + ": " + ex.Message);
+			}
+
+			try
+			{
+				if ((UnityEngine.Object)(object)srv != (UnityEngine.Object)null)
+					srv.ValidateRackPosition();
+				else if ((UnityEngine.Object)(object)sw != (UnityEngine.Object)null)
+					sw.ValidateRackPosition();
+				else if ((UnityEngine.Object)(object)pp != (UnityEngine.Object)null)
+					pp.ValidateRackPosition();
+			}
+			catch
+			{
+			}
+			rp.SetUsed(true);
+			_selectedRack.MarkPositionAsUsed(slotIndex, itemChoice.sizeInU);
+			return true;
+		}
+		catch (Exception ex2)
+		{
+			((MelonBase)this).LoggerInstance.Warning("Profile placement failed: " + ex2.Message);
+			return false;
+		}
+	}
+
+	private int ApplyRackProfileToRack(Rack rack, RackProfileEntry profile)
+	{
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null || profile == null || profile.Items == null)
+			return 0;
+		if (CollectRackUsableObjects(rack).Count > 0)
+		{
+			((MelonBase)this).LoggerInstance.Msg("[RackBuilder] Profile apply skipped: target rack is not empty.");
+			return 0;
+		}
+
+		MainGameManager mgr = GetMainGameManager();
+		if ((UnityEngine.Object)(object)mgr == (UnityEngine.Object)null)
+			return 0;
+		if (_itemChoices.Count == 0)
+			BuildItemChoices();
+
+		Dictionary<string, int> choiceByKey = new Dictionary<string, int>();
+		for (int i = 0; i < _itemChoices.Count; i++)
+		{
+			ItemChoice choice = _itemChoices[i];
+			string key = BuildProfileItemKey(choice.category, choice.prefabIndex);
+			if (!choiceByKey.ContainsKey(key))
+				choiceByKey[key] = i;
+		}
+
+		Rack savedRack = _selectedRack;
+		_selectedRack = rack;
+		TryGetRackOrientationTopHigh(rack, out bool topIsHigh, out int slotCount);
+		int placed = 0;
+		try
+		{
+			foreach (RackProfileItemEntry entry in profile.Items.OrderByDescending((RackProfileItemEntry e) => e.AnchorSlot))
+			{
+				if (entry == null || string.IsNullOrEmpty(entry.Category) || entry.PrefabIndex < 0)
+					continue;
+				string key = BuildProfileItemKey(entry.Category, entry.PrefabIndex);
+				if (!choiceByKey.TryGetValue(key, out int choiceIdx))
+				{
+					((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Profile item unavailable: {entry.Category}:{entry.PrefabIndex}");
+					continue;
+				}
+				ItemChoice choice = _itemChoices[choiceIdx];
+				int slot = entry.AnchorSlot;
+				if (slot < 0 || slot >= slotCount)
+					continue;
+				if (slot + choice.sizeInU > slotCount)
+					continue;
+				if (InstallItemChoiceAtSlot(choice, slot, mgr, topIsHigh, slotCount))
+					placed++;
+			}
+		}
+		finally
+		{
+			_selectedRack = savedRack;
+		}
+		_cachedUsableObjectsTime = -999f;
+		return placed;
+	}
+
+	private void HandleEmptyMountClick(RackMount mount)
+	{
+		if ((UnityEngine.Object)(object)mount == (UnityEngine.Object)null)
+			return;
+		if (mount.isRackInstantiated)
+			return;
+		if (string.IsNullOrEmpty(_armedProfileName))
+		{
+			InstallRackAtMount(mount);
+			return;
+		}
+
+		EnsureRackProfilesLoaded();
+		if (!_rackProfilesByName.TryGetValue(_armedProfileName, out RackProfileEntry profile) || profile == null)
+		{
+			((MelonBase)this).LoggerInstance.Warning("[RackBuilder] Armed profile not found. Installing empty rack instead.");
+			_armedProfileName = null;
+			InstallRackAtMount(mount);
+			return;
+		}
+
+		InstallRackAtMount(mount);
+		Rack rack = ((Component)mount).GetComponentInChildren<Rack>();
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+		{
+			((MelonBase)this).LoggerInstance.Warning("[RackBuilder] Rack profile paste failed: rack missing after mount install.");
+			ShowRackList();
+			return;
+		}
+
+		int placed = ApplyRackProfileToRack(rack, profile);
+		if (placed > 0)
+		{
+			if (!string.IsNullOrEmpty(profile.RackRole) && (profile.RackRole == RackRoleServer || profile.RackRole == RackRoleNetwork))
+			{
+				EnsureRackRolesLoaded();
+				string key = BuildRackRoleKey(rack);
+				if (!string.IsNullOrEmpty(key))
+				{
+					_rackRolesByKey[key] = profile.RackRole;
+					SaveRackRoles();
+				}
+			}
+			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Pasted profile '{profile.Name}' ({placed}/{profile.Items.Count} items) at {((UnityEngine.Object)((Component)mount).gameObject).name}");
+		}
+		else
+		{
+			((MelonBase)this).LoggerInstance.Warning($"[RackBuilder] Profile '{profile.Name}' paste placed no items.");
+		}
+		ShowRackList();
 	}
 
 	private string GetRackRole(Rack rack)
@@ -1027,15 +2189,89 @@ public class RackBuilderCore : MelonMod
 				List<Transform> waypoints = new List<Transform>();
 				waypoints.AddRange(BuildRackExitPath(swPort));
 				waypoints.AddRange(overhead);
-				if (CreateCable(cp, swPort, basePort, waypoints, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.Base, ""))
+				if (CreateCable(cp, swPort, basePort, waypoints, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.Base, "", targetBase.customerID))
+				{
 					wired++;
+					break;
+				}
 			}
 			finally
 			{
 				_selectedRack = prev;
 			}
 		}
+		if (wired > 0)
+			TagRackCustomerConnectivity(sourceRack, targetBase.customerID);
 		return wired;
+	}
+
+	private void TagRackCustomerConnectivity(Rack sourceRack, int customerId)
+	{
+		if (customerId < 0 || (UnityEngine.Object)(object)sourceRack == (UnityEngine.Object)null)
+			return;
+
+		HashSet<int> relevantCableIds = new HashSet<int>();
+		foreach (NetworkSwitch sw in CollectRackSwitches(sourceRack))
+		{
+			if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null || sw.cableLinkSwitchPorts == null)
+				continue;
+			foreach (CableLink swPort in (Il2CppArrayBase<CableLink>)(object)sw.cableLinkSwitchPorts)
+			{
+				if ((UnityEngine.Object)(object)swPort == (UnityEngine.Object)null)
+					continue;
+				int id = swPort.cableIDsOnLink;
+				if (id > 0)
+					relevantCableIds.Add(id);
+				swPort.CustomerID = customerId;
+			}
+		}
+		if (relevantCableIds.Count == 0)
+			return;
+
+		CableLink[] allLinks = UnityEngine.Object.FindObjectsOfType<CableLink>();
+		if (allLinks == null || allLinks.Length == 0)
+			return;
+
+		bool expanded;
+		do
+		{
+			expanded = false;
+			foreach (CableLink link in allLinks)
+			{
+				if ((UnityEngine.Object)(object)link == (UnityEngine.Object)null)
+					continue;
+				int id = link.cableIDsOnLink;
+				if (id <= 0 || !relevantCableIds.Contains(id))
+					continue;
+
+				link.CustomerID = customerId;
+
+				if ((UnityEngine.Object)(object)link.parentPatchPanel == (UnityEngine.Object)null)
+					continue;
+				CableLink paired = link.parentPatchPanel.GetPairedLink(link);
+				if ((UnityEngine.Object)(object)paired == (UnityEngine.Object)null)
+					continue;
+				paired.CustomerID = customerId;
+				int pairedId = paired.cableIDsOnLink;
+				if (pairedId > 0 && relevantCableIds.Add(pairedId))
+					expanded = true;
+			}
+		}
+		while (expanded);
+
+		int tagged = 0;
+		foreach (CableLink link in allLinks)
+		{
+			if ((UnityEngine.Object)(object)link == (UnityEngine.Object)null)
+				continue;
+			int id = link.cableIDsOnLink;
+			if (id > 0 && relevantCableIds.Contains(id))
+			{
+				link.CustomerID = customerId;
+				tagged++;
+			}
+		}
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Tagged customer {customerId} on {tagged} cable endpoints across {relevantCableIds.Count} cable IDs.");
 	}
 
 	/// <summary>
@@ -1104,20 +2340,51 @@ public class RackBuilderCore : MelonMod
 			}
 			if ((UnityEngine.Object)(object)srcPort == (UnityEngine.Object)null) continue;
 
-			// Map server switch index → network switch (A→A, B→B, cycling if net rack has more/fewer).
-			int netIdx = srvIdx % networkSwitches.Count;
-			NetworkSwitch dstSwitch = networkSwitches[netIdx];
-			if (dstSwitch.cableLinkSwitchPorts == null) continue;
-
-			// Pick the first free port on the target network switch that matches fibre type.
-			CableLink dstPort = null;
-			foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)dstSwitch.cableLinkSwitchPorts)
+			// Prefer A→A/B→B by Y ordering, then fall back to any network switch with a free compatible port.
+			int preferredNetIdx = srvIdx % networkSwitches.Count;
+			List<int> candidateOrder = new List<int> { preferredNetIdx };
+			if (networkSwitches.Count > 1)
 			{
-				if (IsPortReadyForCable(port) && port.isFibrePort == srcPort.isFibrePort) { dstPort = port; break; }
+				for (int idx = 0; idx < networkSwitches.Count; idx++)
+				{
+					if (idx == preferredNetIdx)
+						continue;
+					if ((idx % 2) == (srvIdx % 2))
+						candidateOrder.Add(idx);
+				}
+				for (int idx = 0; idx < networkSwitches.Count; idx++)
+				{
+					if (idx == preferredNetIdx || candidateOrder.Contains(idx))
+						continue;
+					candidateOrder.Add(idx);
+				}
 			}
+
+			NetworkSwitch dstSwitch = null;
+			CableLink dstPort = null;
+			int dstSwitchIdx = -1;
+			foreach (int candidateIdx in candidateOrder)
+			{
+				NetworkSwitch candidateSwitch = networkSwitches[candidateIdx];
+				if ((UnityEngine.Object)(object)candidateSwitch == (UnityEngine.Object)null || candidateSwitch.cableLinkSwitchPorts == null)
+					continue;
+				foreach (CableLink port in (Il2CppArrayBase<CableLink>)(object)candidateSwitch.cableLinkSwitchPorts)
+				{
+					if (!IsPortReadyForCable(port) || port.isFibrePort != srcPort.isFibrePort)
+						continue;
+					dstSwitch = candidateSwitch;
+					dstPort = port;
+					dstSwitchIdx = candidateIdx;
+					break;
+				}
+				if ((UnityEngine.Object)(object)dstPort != (UnityEngine.Object)null)
+					break;
+			}
+
 			if ((UnityEngine.Object)(object)dstPort == (UnityEngine.Object)null)
 			{
-				((MelonBase)this).LoggerInstance.Msg($"  Trunk: no free port on net SW[{netIdx}] for server SW[{srvIdx}] (fibre={srcPort.isFibrePort})");
+				if (_enableVerboseDiagnostics)
+					((MelonBase)this).LoggerInstance.Msg($"  Trunk: no free compatible port on network rack for server SW[{srvIdx}] (preferredNetSW={preferredNetIdx}, fibre={srcPort.isFibrePort})");
 				continue;
 			}
 
@@ -1133,7 +2400,8 @@ public class RackBuilderCore : MelonMod
 				if (CreateCable(cp, srcPort, dstPort, waypoints, CableLink.TypeOfLink.Switch, CableLink.TypeOfLink.Switch, ""))
 				{
 					trunkCount++;
-					((MelonBase)this).LoggerInstance.Msg($"  Trunk: server SW[{srvIdx}] → net SW[{netIdx}] (fibre={srcPort.isFibrePort})");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  Trunk: server SW[{srvIdx}] → net SW[{dstSwitchIdx}] (fibre={srcPort.isFibrePort})");
 				}
 			}
 			finally
@@ -1170,12 +2438,12 @@ public class RackBuilderCore : MelonMod
 		try
 		{
 			var topology = new CableTopologyData();
-			topology.LayoutFingerprint = BuildCurrentTopologyFingerprint();
 			HashSet<string> seen = new HashSet<string>();
 			// Use time-cached snapshots — avoids 235ms FindObjectsOfType on every save trigger.
-			var servers = GetServerSnapshot().Where((Server s) => s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.ServerID) && s.ServerID.StartsWith("Mod_")).ToList();
-			var switches = GetNetworkSwitchSnapshot().Where((NetworkSwitch s) => s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.switchId) && s.switchId.StartsWith("Mod_")).ToList();
-			var panels = GetPatchPanelSnapshot().Where((PatchPanel p) => p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p) && !string.IsNullOrEmpty(p.patchPanelId) && p.patchPanelId.StartsWith("Mod_")).ToList();
+			var servers = GetServerSnapshot().Where((Server s) => s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && HasRackBuilderManagedPrefix(s.ServerID)).ToList();
+			var switches = GetNetworkSwitchSnapshot().Where((NetworkSwitch s) => s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s) && HasRackBuilderManagedPrefix(s.switchId)).ToList();
+			var panels = GetPatchPanelSnapshot().Where((PatchPanel p) => p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p) && HasRackBuilderManagedPrefix(p.patchPanelId)).ToList();
+			topology.LayoutFingerprint = BuildTopologyFingerprintFromSnapshots(servers, switches, panels, out _);
 
 			Dictionary<int, CableLink> switchPortByCableId = new Dictionary<int, CableLink>();
 			foreach (NetworkSwitch sw in switches)
@@ -1275,10 +2543,13 @@ public class RackBuilderCore : MelonMod
 			watch.Stop();
 			((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Topology built in {watch.ElapsedMilliseconds}ms ({topology.Cables.Count} cables, servers={servers.Count}, switches={switches.Count}, patchPanels={panels.Count}) — writing async");
 			// Hand serialize + disk write off the main thread — topology is pure C# by this point.
+			int writeVersion = System.Threading.Interlocked.Increment(ref _topologyWriteVersion);
 			var topologyCapture = topology;
 			System.Threading.Tasks.Task.Run(() =>
 			{
-				string json = JsonSerializer.Serialize(topologyCapture, new JsonSerializerOptions { WriteIndented = true });
+				if (writeVersion != System.Threading.Volatile.Read(ref _topologyWriteVersion))
+					return;
+				string json = JsonSerializer.Serialize(topologyCapture, IndentedJsonOptions);
 				File.WriteAllText(filePath, json);
 			});
 		}
@@ -1320,7 +2591,7 @@ public class RackBuilderCore : MelonMod
 				return;
 			}
 			var serversById = UnityEngine.Object.FindObjectsOfType<Server>()
-				.Where((Server s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.ServerID) && s.ServerID.StartsWith("Mod_"))
+				.Where((Server s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cablelinks != null && IsPlacedRackObject((Component)(object)s) && HasRackBuilderManagedPrefix(s.ServerID))
 				.GroupBy((Server s) => s.ServerID)
 				.ToDictionary((IGrouping<string, Server> g) => g.Key, (IGrouping<string, Server> g) => g.First());
 			var serversByRackPositionUid = UnityEngine.Object.FindObjectsOfType<Server>()
@@ -1330,7 +2601,7 @@ public class RackBuilderCore : MelonMod
 				.GroupBy((x) => x.RackPositionUid)
 				.ToDictionary((IGrouping<int, dynamic> g) => g.Key, (IGrouping<int, dynamic> g) => (Server)g.First().Server);
 			var switchesById = UnityEngine.Object.FindObjectsOfType<NetworkSwitch>()
-				.Where((NetworkSwitch s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s) && !string.IsNullOrEmpty(s.switchId) && s.switchId.StartsWith("Mod_"))
+				.Where((NetworkSwitch s) => (UnityEngine.Object)(object)s != (UnityEngine.Object)null && s.cableLinkSwitchPorts != null && IsPlacedRackObject((Component)(object)s) && HasRackBuilderManagedPrefix(s.switchId))
 				.GroupBy((NetworkSwitch s) => s.switchId)
 				.ToDictionary((IGrouping<string, NetworkSwitch> g) => g.Key, (IGrouping<string, NetworkSwitch> g) => g.First());
 			var switchesByRackPositionUid = UnityEngine.Object.FindObjectsOfType<NetworkSwitch>()
@@ -1340,7 +2611,7 @@ public class RackBuilderCore : MelonMod
 				.GroupBy((x) => x.RackPositionUid)
 				.ToDictionary((IGrouping<int, dynamic> g) => g.Key, (IGrouping<int, dynamic> g) => (NetworkSwitch)g.First().Switch);
 			var panelsById = UnityEngine.Object.FindObjectsOfType<PatchPanel>()
-				.Where((PatchPanel p) => (UnityEngine.Object)(object)p != (UnityEngine.Object)null && p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p) && !string.IsNullOrEmpty(p.patchPanelId) && p.patchPanelId.StartsWith("Mod_"))
+				.Where((PatchPanel p) => (UnityEngine.Object)(object)p != (UnityEngine.Object)null && p.cableLinkPorts != null && IsPlacedRackObject((Component)(object)p) && HasRackBuilderManagedPrefix(p.patchPanelId))
 				.GroupBy((PatchPanel p) => p.patchPanelId)
 				.ToDictionary((IGrouping<string, PatchPanel> g) => g.Key, (IGrouping<string, PatchPanel> g) => g.First());
 			var panelsByRackPositionUid = UnityEngine.Object.FindObjectsOfType<PatchPanel>()
@@ -1527,7 +2798,11 @@ public class RackBuilderCore : MelonMod
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null) return;
 		CablePositions cp = GetCablePositionsCached();
 		if ((UnityEngine.Object)(object)cp == (UnityEngine.Object)null) return;
+		int before = GetRackCableIds(_selectedRack).Count;
 		AutoWireRack(); // reuses all the existing cable-creation logic; skips already-wired ports
+		int after = GetRackCableIds(_selectedRack).Count;
+		if (after > before)
+			wiredCount += after - before;
 	}
 
 	private IEnumerator ScrubPlacedDeviceCableIds(GameObject go, int frames)
@@ -1568,7 +2843,7 @@ public class RackBuilderCore : MelonMod
 						serverLink.cableIDsOnLink = -1;
 					}
 				}
-				if (i == frames - 1)
+				if (_enableVerboseDiagnostics && i == frames - 1)
 				{
 					try
 					{
@@ -1624,7 +2899,7 @@ public class RackBuilderCore : MelonMod
 						switchLink.cableIDsOnLink = -1;
 					}
 				}
-				if (i == frames - 1)
+				if (_enableVerboseDiagnostics && i == frames - 1)
 				{
 					try
 					{
@@ -1813,15 +3088,15 @@ public class RackBuilderCore : MelonMod
 				val5.verticalFit = (ContentSizeFitter.FitMode)2;
 				break;
 			}
+			_rackReturnButtons.Clear();
 			Il2CppArrayBase<ButtonExtended> componentsInChildren3 = _rackScreen.GetComponentsInChildren<ButtonExtended>();
 			foreach (ButtonExtended item5 in componentsInChildren3)
 			{
-				if ((UnityEngine.Object)(object)item5 != (UnityEngine.Object)null && ((UnityEngine.Object)((Component)item5).gameObject).name.Contains("Return"))
-				{
-					((UnityEventBase)item5.onClick).RemoveAllListeners();
-					((UnityEvent)item5.onClick).AddListener((Action)OnReturnClicked);
-					break;
-				}
+				if ((UnityEngine.Object)(object)item5 == (UnityEngine.Object)null || !((UnityEngine.Object)((Component)item5).gameObject).name.Contains("Return"))
+					continue;
+				((UnityEventBase)item5.onClick).RemoveAllListeners();
+				((UnityEvent)item5.onClick).AddListener((Action)OnReturnClicked);
+				_rackReturnButtons.Add(item5);
 			}
 			_integrated = true;
 			((MelonBase)this).LoggerInstance.Msg("Rack Manager integrated into laptop!");
@@ -1846,6 +3121,15 @@ public class RackBuilderCore : MelonMod
 
 	private void OnReturnClicked()
 	{
+		if (_profileNameDialogActive)
+		{
+			if ((UnityEngine.Object)(object)_profileNameDialogInput != (UnityEngine.Object)null)
+			{
+				_profileNameDialogInput.ActivateInputField();
+				_profileNameDialogInput.Select();
+			}
+			return;
+		}
 		if (_onDetailPage)
 		{
 			_onDetailPage = false;
@@ -1885,6 +3169,11 @@ public class RackBuilderCore : MelonMod
 		//IL_065f: Unknown result type (might be due to invalid IL or missing references)
 		//IL_06a4: Unknown result type (might be due to invalid IL or missing references)
 		//IL_06ab: Expected O, but got Unknown
+		if (_profileNameDialogActive)
+		{
+			ShowProfileNameDialog();
+			return;
+		}
 		ClearContent();
 		_pendingBulkClearConfirmation = false;
 		_allRacks.Clear();
@@ -1915,6 +3204,51 @@ public class RackBuilderCore : MelonMod
 			{
 				OpenAllWalls();
 			});
+		}
+		if (_batchAutoWireInProgress)
+		{
+			AddColorLabel("  Batch auto-wire running...", new Color(0.7f, 0.7f, 0.2f));
+		}
+		else
+		{
+			AddClickableRow("  AUTO-WIRE ALL RACKS (batch)", new Color(0.2f, 0.35f, 0.2f), delegate
+			{
+				MelonCoroutines.Start(BatchAutoWireAllRacksFromFloorPlanDeferred(1));
+				ShowRackList();
+			});
+		}
+		EnsureRackProfilesLoaded();
+		if (_rackProfilesByName.Count > 0)
+		{
+			AddColorLabel($"  Rack Profiles: {_rackProfilesByName.Count} saved", Color.white);
+			if (!string.IsNullOrEmpty(_armedProfileName))
+				AddColorLabel($"    Paste mode armed: {_armedProfileName} (click empty rack slot)", new Color(0.9f, 0.85f, 0.5f));
+			foreach (RackProfileEntry profile in _rackProfilesByName.Values.OrderByDescending((RackProfileEntry p) => p.CreatedUtc ?? "").Take(6))
+			{
+				RackProfileEntry localProfile = profile;
+				bool armed = string.Equals(_armedProfileName, localProfile.Name, StringComparison.OrdinalIgnoreCase);
+				AddClickableRow($"    {(armed ? "[ARMED]" : "[ARM]")} {localProfile.Name} ({localProfile.Items.Count} items)", new Color(0.22f, 0.24f, 0.35f), delegate
+				{
+					_armedProfileName = localProfile.Name;
+					ShowRackList();
+				});
+			}
+			if (!string.IsNullOrEmpty(_armedProfileName))
+			{
+				AddClickableRow("    RENAME ARMED PROFILE...", new Color(0.25f, 0.22f, 0.38f), delegate
+				{
+					string currentName = _armedProfileName;
+					OpenProfileNameDialog("Rename Rack Profile", currentName, false, delegate(string newName)
+					{
+						RenameProfile(currentName, newName);
+					});
+				});
+				AddClickableRow("    CANCEL PASTE MODE", new Color(0.35f, 0.15f, 0.15f), delegate
+				{
+					_armedProfileName = null;
+					ShowRackList();
+				});
+			}
 		}
 		List<RackMount> list = GetMountSnapshot();
 		if (list.Count == 0)
@@ -1950,7 +3284,8 @@ public class RackBuilderCore : MelonMod
 			}
 		}
 		list3.Add(list2.Count - num3);
-		((MelonBase)this).LoggerInstance.Msg($"Grid pattern: {string.Join("-", list3)} ({list2.Count} columns)");
+		if (_enableVerboseDiagnostics)
+			((MelonBase)this).LoggerInstance.Msg($"Grid pattern: {string.Join("-", list3)} ({list2.Count} columns)");
 		SortedSet<int> sortedSet2 = new SortedSet<int>();
 		foreach (RackMount item5 in list)
 		{
@@ -2060,7 +3395,7 @@ public class RackBuilderCore : MelonMod
 						RackMount m2 = value;
 						((UnityEvent)val11.onClick).AddListener((Action)delegate
 						{
-							InstallRackAtMount(m2);
+							HandleEmptyMountClick(m2);
 						});
 					}
 				}
@@ -2207,6 +3542,54 @@ public class RackBuilderCore : MelonMod
 		((MelonBase)this).LoggerInstance.Msg($"Removed rack at {((UnityEngine.Object)((Component)mount).gameObject).name}: {num2} items, {num} cables");
 	}
 
+	private HashSet<int> GetRackCableIds(Rack rack)
+	{
+		HashSet<int> ids = new HashSet<int>();
+		if ((UnityEngine.Object)(object)rack == (UnityEngine.Object)null)
+			return ids;
+		foreach (CableLink cl in ((Component)rack).GetComponentsInChildren<CableLink>(true))
+		{
+			if ((UnityEngine.Object)(object)cl == (UnityEngine.Object)null)
+				continue;
+			int id = cl.cableIDsOnLink;
+			if (id > 0)
+				ids.Add(id);
+		}
+		return ids;
+	}
+
+	private int DisconnectRackCables(Rack rack)
+	{
+		HashSet<int> ids = GetRackCableIds(rack);
+		if (ids.Count == 0)
+			return 0;
+		CablePositions cp = GetCablePositionsCached();
+		foreach (int id in ids)
+		{
+			try
+			{
+				if ((UnityEngine.Object)(object)cp != (UnityEngine.Object)null)
+					cp.RemovePosition(id);
+			}
+			catch
+			{
+			}
+		}
+		int cleared = 0;
+		foreach (CableLink cl in UnityEngine.Object.FindObjectsOfType<CableLink>())
+		{
+			if ((UnityEngine.Object)(object)cl == (UnityEngine.Object)null)
+				continue;
+			if (!ids.Contains(cl.cableIDsOnLink))
+				continue;
+			cl.cableIDsOnLink = -1;
+			cleared++;
+		}
+		_autoWireProtectedCableIds.RemoveWhere((int id) => ids.Contains(id));
+		((MelonBase)this).LoggerInstance.Msg($"[RackBuilder] Rack cable disconnect: removed {ids.Count} cables ({cleared} endpoints)");
+		return cleared;
+	}
+
 	// Clears ghost cable IDs from stale prefabs/saves.
 	// Valid finished cables should have exactly 2 endpoint ports; anything else is treated as ghost/stale state.
 	private void SanitizeGhostCableIDs()
@@ -2282,6 +3665,11 @@ public class RackBuilderCore : MelonMod
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null || _selectedRack.positions == null)
 			return result;
 
+		Transform rackTransform = ((Component)_selectedRack).transform;
+		RackMount rackMount = ((Component)_selectedRack).GetComponentInParent<RackMount>();
+		Transform mountTransform = ((UnityEngine.Object)(object)rackMount == (UnityEngine.Object)null) ? null : ((Component)rackMount).transform;
+		bool hasPendingRemovals = _pendingRemovalUsableIds.Count > 0;
+
 		HashSet<int> rpInstanceIds = new HashSet<int>();
 		HashSet<int> rpUids = new HashSet<int>();
 		foreach (RackPosition rp in (Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions)
@@ -2296,6 +3684,9 @@ public class RackBuilderCore : MelonMod
 		foreach (UsableObject uo in GetUsableObjectSnapshot())
 		{
 			if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
+			int pendingId = ((UnityEngine.Object)(object)uo).GetInstanceID();
+			if (hasPendingRemovals && _pendingRemovalUsableIds.Contains(pendingId))
+				continue;
 			bool inRack = false;
 			if ((UnityEngine.Object)(object)uo.currentRackPosition != (UnityEngine.Object)null)
 			{
@@ -2303,9 +3694,17 @@ public class RackBuilderCore : MelonMod
 				inRack = rpInstanceIds.Contains(rpId);
 			}
 			if (!inRack && uo.rackPositionUID > 0)
-				inRack = rpUids.Contains(uo.rackPositionUID);
+			{
+				if (rpUids.Contains(uo.rackPositionUID))
+				{
+					Transform t = ((Component)uo).transform;
+					bool underOwnedHierarchy = t.IsChildOf(rackTransform)
+						|| (mountTransform != null && t.IsChildOf(mountTransform));
+					inRack = underOwnedHierarchy;
+				}
+			}
 			if (!inRack) continue;
-			int id = ((UnityEngine.Object)(object)uo).GetInstanceID();
+			int id = pendingId;
 			if (seen.Add(id))
 				result.Add(uo);
 		}
@@ -2358,7 +3757,7 @@ public class RackBuilderCore : MelonMod
 		return result;
 	}
 
-	private bool CreateCable(CablePositions cablePositions, CableLink startPort, CableLink endPort, IEnumerable<Transform> waypoints, CableLink.TypeOfLink startType, CableLink.TypeOfLink endType, string serverId = "")
+	private bool CreateCable(CablePositions cablePositions, CableLink startPort, CableLink endPort, IEnumerable<Transform> waypoints, CableLink.TypeOfLink startType, CableLink.TypeOfLink endType, string serverId = "", int customerId = -1)
 	{
 		if ((UnityEngine.Object)(object)cablePositions == (UnityEngine.Object)null || (UnityEngine.Object)(object)startPort == (UnityEngine.Object)null || (UnityEngine.Object)(object)endPort == (UnityEngine.Object)null)
 			return false;
@@ -2400,6 +3799,18 @@ public class RackBuilderCore : MelonMod
 			endPort.isEndPoint = true;
 			startPort.typeOfLink = startType;
 			endPort.typeOfLink = endType;
+			if (customerId < 0)
+			{
+				if (startPort.CustomerID >= 0)
+					customerId = startPort.CustomerID;
+				else if (endPort.CustomerID >= 0)
+					customerId = endPort.CustomerID;
+			}
+			if (customerId >= 0)
+			{
+				startPort.CustomerID = customerId;
+				endPort.CustomerID = customerId;
+			}
 			float aSpeed = ((startPort.isSFPPort && (UnityEngine.Object)(object)startPort.insertedSFP != (UnityEngine.Object)null) ? startPort.insertedSFP.speed : startPort.connectionSpeed);
 			float bSpeed = ((endPort.isSFPPort && (UnityEngine.Object)(object)endPort.insertedSFP != (UnityEngine.Object)null) ? endPort.insertedSFP.speed : endPort.connectionSpeed);
 			float cableSpeed = 0f;
@@ -2554,6 +3965,11 @@ public class RackBuilderCore : MelonMod
 		//IL_0c39: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0c59: Unknown result type (might be due to invalid IL or missing references)
 		//IL_1178: Unknown result type (might be due to invalid IL or missing references)
+		if (_profileNameDialogActive)
+		{
+			ShowProfileNameDialog();
+			return;
+		}
 		ClearContent();
 		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null)
 		{
@@ -2722,9 +4138,11 @@ public class RackBuilderCore : MelonMod
 		// Uses currentRackPosition object-reference ? immune to UID integer collisions across racks.
 		if (slotsFound.Count < num)
 		{
+			bool hasPendingRemovals = _pendingRemovalUsableIds.Count > 0;
 			foreach (UsableObject uo in GetUsableObjectSnapshot())
 			{
 				if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null) continue;
+				if (hasPendingRemovals && _pendingRemovalUsableIds.Contains(((UnityEngine.Object)(object)uo).GetInstanceID())) continue;
 				if ((UnityEngine.Object)(object)uo.currentRackPosition == (UnityEngine.Object)null) continue;
 				int rpId = ((Component)uo.currentRackPosition).gameObject.GetInstanceID();
 				if (!rpInstanceToSlot.TryGetValue(rpId, out int slot)) continue;
@@ -2770,8 +4188,8 @@ public class RackBuilderCore : MelonMod
 					int removed = RemoveAllItemsFromSelectedRack();
 					_pendingBulkClearConfirmation = false;
 					((MelonBase)this).LoggerInstance.Msg($"Bulk remove complete: removed {removed} installed items");
-					ShowRackDetail();
-					MelonCoroutines.Start(RefreshRackDetailDeferred(2));
+					QueueSaveTopology();
+					MelonCoroutines.Start(RefreshRackDetailDeferred(3));
 				});
 				AddClickableRow("  NO - Cancel bulk remove", new Color(0.2f, 0.2f, 0.2f), delegate
 				{
@@ -2785,6 +4203,20 @@ public class RackBuilderCore : MelonMod
 		{
 			_pendingBulkClearConfirmation = false;
 		}
+		EnsureRackProfilesLoaded();
+		AddClickableRow($"  SAVE RACK PROFILE (AUTO NAME) ({_rackProfilesByName.Count} saved)", new Color(0.2f, 0.22f, 0.36f), delegate
+		{
+			SaveSelectedRackAsProfile();
+		});
+		AddClickableRow("  SAVE RACK PROFILE (CUSTOM NAME...)", new Color(0.2f, 0.26f, 0.42f), delegate
+		{
+			OpenProfileNameDialog("Save Rack Profile As", BuildNewProfileName(), true, delegate(string name)
+			{
+				SaveSelectedRackAsProfile(name, false);
+			});
+		});
+		AddColorLabel("  Custom name opens a small input window so you can type profile names directly.", new Color(0.75f, 0.75f, 0.85f));
+		AddColorLabel("  Saved profiles can be pasted from Floor Plan onto empty rack slots.", new Color(0.75f, 0.75f, 0.85f));
 		AddDivider();
 		AddColorLabel("  Networking", new Color(1f, 0.8f, 0.3f));
 		Color bgColor = default(Color);
@@ -2867,20 +4299,119 @@ public class RackBuilderCore : MelonMod
 		{
 			AddColorLabel($"  {num8} unwired servers but no free switch ports", new Color(0.5f, 0.3f, 0.3f));
 		}
+		int activeRackCables = GetRackCableIds(_selectedRack).Count;
+		if (activeRackCables > 0)
+		{
+			AddClickableRow($"  DISCONNECT CABLES - remove {activeRackCables} active cables", new Color(0.45f, 0.2f, 0.12f), delegate
+			{
+				DisconnectRackCables(_selectedRack);
+				QueueSaveTopology();
+				ShowRackDetail();
+			});
+		}
 		int num13 = 0;
+		int num13Sfp = 0;
+		int num13Qsfp = 0;
+		Dictionary<int, (int sfp, int qsfp)> emptyPortsBySwitch = new Dictionary<int, (int sfp, int qsfp)>();
 		foreach (NetworkSwitch sw2 in rackSwitches)
 		{
-			if (sw2.cableLinkSwitchPorts == null) continue;
+			if ((UnityEngine.Object)(object)sw2 == (UnityEngine.Object)null || sw2.cableLinkSwitchPorts == null)
+				continue;
+			int switchSfp = 0;
+			int switchQsfp = 0;
 			foreach (CableLink cl2 in (Il2CppArrayBase<CableLink>)(object)sw2.cableLinkSwitchPorts)
 			{
-				if ((UnityEngine.Object)(object)cl2 != (UnityEngine.Object)null && cl2.isSFPPort && (UnityEngine.Object)(object)cl2.insertedSFP == (UnityEngine.Object)null)
-					num13++;
+				if ((UnityEngine.Object)(object)cl2 == (UnityEngine.Object)null || !cl2.isSFPPort || (UnityEngine.Object)(object)cl2.insertedSFP != (UnityEngine.Object)null)
+					continue;
+				if (GetPortFamily(cl2) == PortFamilyQsfp)
+				{
+					num13Qsfp++;
+					switchQsfp++;
+				}
+				else
+				{
+					num13Sfp++;
+					switchSfp++;
+				}
+			}
+			if (switchSfp > 0 || switchQsfp > 0)
+			{
+				emptyPortsBySwitch[((UnityEngine.Object)(object)sw2).GetInstanceID()] = (switchSfp, switchQsfp);
 			}
 		}
+		num13 = num13Sfp + num13Qsfp;
 		if (num13 > 0)
 		{
-			AddColorLabel($"  Auto-SFP: {num13} empty SFP/QSFP+ ports", Color.white);
-			AddClickableRow("  AUTO-FILL - Insert modules into all empty SFP ports", new Color(0.1f, 0.3f, 0.4f), delegate
+			AddColorLabel($"  Auto-SFP: {num13} empty ports (SFP: {num13Sfp}, QSFP: {num13Qsfp})", Color.white);
+			MainGameManager mainGameManager = GetMainGameManager();
+			List<(int sfpType, float speed, int prefabIdx, string name)> list2 = BuildSfpPrefabList(mainGameManager);
+			PruneAutoFillSwitchOverrides(rackSwitches);
+			if (list2.Count > 0)
+			{
+				List<int> sfpChoices = BuildAutoFillChoiceOrder(list2, PortFamilySfp);
+				List<int> qsfpChoices = BuildAutoFillChoiceOrder(list2, PortFamilyQsfp);
+				AddClickableRow($"  MODULE DEFAULT (SFP): {DescribeAutoFillChoice(_autoFillDefaultSfpPrefabIdx, list2)}", new Color(0.08f, 0.22f, 0.32f), delegate
+				{
+					_autoFillDefaultSfpPrefabIdx = CycleAutoFillChoice(_autoFillDefaultSfpPrefabIdx, sfpChoices);
+					ShowRackDetail();
+				});
+				AddClickableRow($"  MODULE DEFAULT (QSFP): {DescribeAutoFillChoice(_autoFillDefaultQsfpPrefabIdx, list2)}", new Color(0.08f, 0.22f, 0.32f), delegate
+				{
+					_autoFillDefaultQsfpPrefabIdx = CycleAutoFillChoice(_autoFillDefaultQsfpPrefabIdx, qsfpChoices);
+					ShowRackDetail();
+				});
+				foreach (NetworkSwitch rackSwitch in rackSwitches)
+				{
+					if ((UnityEngine.Object)(object)rackSwitch == (UnityEngine.Object)null || rackSwitch.cableLinkSwitchPorts == null)
+					{
+						continue;
+					}
+					int switchId = ((UnityEngine.Object)(object)rackSwitch).GetInstanceID();
+					if (!emptyPortsBySwitch.TryGetValue(switchId, out var counts))
+					{
+						continue;
+					}
+					NetworkSwitch switchCopy = rackSwitch;
+					string switchName = ((UnityEngine.Object)((Component)switchCopy).gameObject).name;
+					if (counts.sfp > 0)
+					{
+						int selectedChoice = GetAutoFillChoiceForSwitch(switchCopy, PortFamilySfp);
+						AddClickableRow($"    {switchName} SFP ({counts.sfp} empty): {DescribeAutoFillChoice(selectedChoice, list2)}", new Color(0.08f, 0.2f, 0.26f), delegate
+						{
+							int currentChoice = GetAutoFillChoiceForSwitch(switchCopy, PortFamilySfp);
+							int nextChoice = CycleAutoFillChoice(currentChoice, sfpChoices);
+							if (nextChoice == _autoFillDefaultSfpPrefabIdx)
+							{
+								_autoFillSfpPrefabBySwitchId.Remove(switchId);
+							}
+							else
+							{
+								_autoFillSfpPrefabBySwitchId[switchId] = nextChoice;
+							}
+							ShowRackDetail();
+						});
+					}
+					if (counts.qsfp > 0)
+					{
+						int selectedChoice = GetAutoFillChoiceForSwitch(switchCopy, PortFamilyQsfp);
+						AddClickableRow($"    {switchName} QSFP ({counts.qsfp} empty): {DescribeAutoFillChoice(selectedChoice, list2)}", new Color(0.08f, 0.2f, 0.26f), delegate
+						{
+							int currentChoice = GetAutoFillChoiceForSwitch(switchCopy, PortFamilyQsfp);
+							int nextChoice = CycleAutoFillChoice(currentChoice, qsfpChoices);
+							if (nextChoice == _autoFillDefaultQsfpPrefabIdx)
+							{
+								_autoFillQsfpPrefabBySwitchId.Remove(switchId);
+							}
+							else
+							{
+								_autoFillQsfpPrefabBySwitchId[switchId] = nextChoice;
+							}
+							ShowRackDetail();
+						});
+					}
+				}
+			}
+			AddClickableRow("  AUTO-FILL - Insert modules into empty SFP/QSFP ports", new Color(0.1f, 0.3f, 0.4f), delegate
 			{
 				AutoFillSfpModules();
 			});
@@ -2908,14 +4439,14 @@ public class RackBuilderCore : MelonMod
 				num15++;
 		}
 		int num17 = 0;
-		foreach (CustomerBase item13 in GetCustomerSnapshot())
+		foreach (CustomerBase item14 in GetCustomerSnapshot())
 		{
-			if ((UnityEngine.Object)(object)item13 == (UnityEngine.Object)null)
+			if ((UnityEngine.Object)(object)item14 == (UnityEngine.Object)null)
 				continue;
-			if (item13.cableLinks == null) continue;
-			foreach (CableLink item14 in (Il2CppArrayBase<CableLink>)(object)item13.cableLinks)
+			if (item14.cableLinks == null) continue;
+			foreach (CableLink item15 in (Il2CppArrayBase<CableLink>)(object)item14.cableLinks)
 			{
-				if ((UnityEngine.Object)(object)item14 != (UnityEngine.Object)null && item14.cableIDsOnLink <= 0)
+				if ((UnityEngine.Object)(object)item15 != (UnityEngine.Object)null && item15.cableIDsOnLink <= 0)
 					num17++;
 			}
 		}
@@ -3024,11 +4555,13 @@ public class RackBuilderCore : MelonMod
 				SFPModule val2 = val.GetComponent<SFPModule>() ?? val.GetComponentInChildren<SFPModule>();
 				if ((UnityEngine.Object)(object)val2 == (UnityEngine.Object)null)
 				{
-					((MelonBase)this).LoggerInstance.Msg($"  sfpPrefabs[{i}] {((UnityEngine.Object)val).name} ? no SFPModule component");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  sfpPrefabs[{i}] {((UnityEngine.Object)val).name} ? no SFPModule component");
 				}
 				else
 				{
-					((MelonBase)this).LoggerInstance.Msg($"  sfpPrefabs[{i}] {((UnityEngine.Object)val).name} ? sfpType={val2.sfpType} speed={val2.speed}");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  sfpPrefabs[{i}] {((UnityEngine.Object)val).name} ? sfpType={val2.sfpType} speed={val2.speed}");
 					list.Add((val2.sfpType, val2.speed, i, ((UnityEngine.Object)val).name));
 				}
 			}
@@ -3037,8 +4570,195 @@ public class RackBuilderCore : MelonMod
 		return list;
 	}
 
-	private int FindBestSfpPrefab(List<(int sfpType, float speed, int prefabIdx, string name)> list, int requiredType, float requiredSpeed)
+	private string NormalizePortFamily(string family)
 	{
+		if (string.Equals(family, PortFamilyQsfp, StringComparison.OrdinalIgnoreCase))
+		{
+			return PortFamilyQsfp;
+		}
+		if (string.Equals(family, PortFamilySfp, StringComparison.OrdinalIgnoreCase))
+		{
+			return PortFamilySfp;
+		}
+		return PortFamilyUnknown;
+	}
+
+	private string GetModuleFamilyFromName(string moduleName)
+	{
+		string text = (moduleName ?? string.Empty).ToLowerInvariant();
+		if (text.Contains("qsfp"))
+		{
+			return PortFamilyQsfp;
+		}
+		if (text.Contains("sfp"))
+		{
+			return PortFamilySfp;
+		}
+		return PortFamilyUnknown;
+	}
+
+	private string GetPortFamily(CableLink port)
+	{
+		if ((UnityEngine.Object)(object)port == (UnityEngine.Object)null)
+		{
+			return PortFamilyUnknown;
+		}
+		string text = ((UnityEngine.Object)((Component)port).gameObject).name.ToLowerInvariant();
+		if (text.Contains("qsfp"))
+		{
+			return PortFamilyQsfp;
+		}
+		if (text.Contains("sfp"))
+		{
+			return PortFamilySfp;
+		}
+		return (port.sfpTypeSupported >= 3) ? PortFamilyQsfp : PortFamilySfp;
+	}
+
+	private bool IsModuleFamilyCompatibleWithPort(string moduleFamily, string portFamily)
+	{
+		string text = NormalizePortFamily(moduleFamily);
+		string text2 = NormalizePortFamily(portFamily);
+		if (text == PortFamilyUnknown || text2 == PortFamilyUnknown)
+		{
+			return true;
+		}
+		return text == text2;
+	}
+
+	private Dictionary<int, int> GetAutoFillOverridesForFamily(string portFamily)
+	{
+		return (NormalizePortFamily(portFamily) == PortFamilyQsfp) ? _autoFillQsfpPrefabBySwitchId : _autoFillSfpPrefabBySwitchId;
+	}
+
+	private int GetAutoFillDefaultForFamily(string portFamily)
+	{
+		return (NormalizePortFamily(portFamily) == PortFamilyQsfp) ? _autoFillDefaultQsfpPrefabIdx : _autoFillDefaultSfpPrefabIdx;
+	}
+
+	private List<int> BuildAutoFillChoiceOrder(List<(int sfpType, float speed, int prefabIdx, string name)> prefabs, string portFamily)
+	{
+		string normalizedFamily = NormalizePortFamily(portFamily);
+		List<int> list = new List<int> { -1 };
+		HashSet<int> hashSet = new HashSet<int>();
+		for (int i = 0; i < prefabs.Count; i++)
+		{
+			(int sfpType, float speed, int prefabIdx, string name) tuple = prefabs[i];
+			string moduleFamily = GetModuleFamilyFromName(tuple.name);
+			bool include = normalizedFamily == PortFamilyUnknown
+				|| moduleFamily == normalizedFamily
+				|| moduleFamily == PortFamilyUnknown;
+			if (!include)
+			{
+				continue;
+			}
+			if (hashSet.Add(tuple.prefabIdx))
+			{
+				list.Add(tuple.prefabIdx);
+			}
+		}
+		return list;
+	}
+
+	private string DescribeAutoFillChoice(int prefabIdx, List<(int sfpType, float speed, int prefabIdx, string name)> prefabs)
+	{
+		if (prefabIdx < 0)
+		{
+			return "AUTO (Best Match)";
+		}
+		for (int i = 0; i < prefabs.Count; i++)
+		{
+			(int sfpType, float speed, int prefabIdx, string name) tuple = prefabs[i];
+			if (tuple.prefabIdx == prefabIdx)
+			{
+				return $"{tuple.name} (type {tuple.sfpType}, {tuple.speed:0.#} Gbps)";
+			}
+		}
+		return "AUTO (Best Match)";
+	}
+
+	private int GetAutoFillChoiceForSwitch(NetworkSwitch sw, string portFamily)
+	{
+		int autoFillDefaultForFamily = GetAutoFillDefaultForFamily(portFamily);
+		if ((UnityEngine.Object)(object)sw == (UnityEngine.Object)null)
+		{
+			return autoFillDefaultForFamily;
+		}
+		Dictionary<int, int> autoFillOverridesForFamily = GetAutoFillOverridesForFamily(portFamily);
+		int instanceID = ((UnityEngine.Object)(object)sw).GetInstanceID();
+		if (autoFillOverridesForFamily.TryGetValue(instanceID, out var value))
+		{
+			return value;
+		}
+		return autoFillDefaultForFamily;
+	}
+
+	private bool TryGetSfpPrefabInfo(List<(int sfpType, float speed, int prefabIdx, string name)> prefabs, int prefabIdx, out int sfpType, out float speed, out string name, out string family)
+	{
+		sfpType = 0;
+		speed = 0f;
+		name = "";
+		family = PortFamilyUnknown;
+		for (int i = 0; i < prefabs.Count; i++)
+		{
+			(int sfpType, float speed, int prefabIdx, string name) tuple = prefabs[i];
+			if (tuple.prefabIdx == prefabIdx)
+			{
+				sfpType = tuple.sfpType;
+				speed = tuple.speed;
+				name = tuple.name;
+				family = GetModuleFamilyFromName(tuple.name);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private int CycleAutoFillChoice(int current, List<int> order)
+	{
+		if (order == null || order.Count == 0)
+		{
+			return -1;
+		}
+		int num = order.IndexOf(current);
+		if (num < 0)
+		{
+			num = 0;
+		}
+		return order[(num + 1) % order.Count];
+	}
+
+	private void PruneAutoFillSwitchOverrides(IEnumerable<NetworkSwitch> rackSwitches)
+	{
+		HashSet<int> hashSet = new HashSet<int>();
+		foreach (NetworkSwitch rackSwitch in rackSwitches)
+		{
+			if (!((UnityEngine.Object)(object)rackSwitch == (UnityEngine.Object)null))
+			{
+				hashSet.Add(((UnityEngine.Object)(object)rackSwitch).GetInstanceID());
+			}
+		}
+		List<int> list = _autoFillSfpPrefabBySwitchId.Keys.ToList();
+		for (int i = 0; i < list.Count; i++)
+		{
+			if (!hashSet.Contains(list[i]))
+			{
+				_autoFillSfpPrefabBySwitchId.Remove(list[i]);
+			}
+		}
+		List<int> list2 = _autoFillQsfpPrefabBySwitchId.Keys.ToList();
+		for (int j = 0; j < list2.Count; j++)
+		{
+			if (!hashSet.Contains(list2[j]))
+			{
+				_autoFillQsfpPrefabBySwitchId.Remove(list2[j]);
+			}
+		}
+	}
+
+	private int FindBestSfpPrefab(List<(int sfpType, float speed, int prefabIdx, string name)> list, int requiredType, float requiredSpeed, string portFamily)
+	{
+		string normalizedFamily = NormalizePortFamily(portFamily);
 		int num = -1;
 		float num2 = -1f;
 		int num3 = -1;
@@ -3046,6 +4766,9 @@ public class RackBuilderCore : MelonMod
 		for (int i = 0; i < list.Count; i++)
 		{
 			(int, float, int, string) tuple = list[i];
+			string moduleFamily = GetModuleFamilyFromName(tuple.Item4);
+			if (normalizedFamily != PortFamilyUnknown && moduleFamily != normalizedFamily && moduleFamily != PortFamilyUnknown)
+				continue;
 			if (tuple.Item1 != requiredType)
 				continue;
 			float speed = tuple.Item2;
@@ -3073,58 +4796,64 @@ public class RackBuilderCore : MelonMod
 			return num;
 		if (num3 >= 0)
 			return num3;
+
+		int fallbackIdx = -1;
+		float fallbackOver = -1f;
+		for (int j = 0; j < list.Count; j++)
+		{
+			(int, float, int, string) tuple2 = list[j];
+			string moduleFamily2 = GetModuleFamilyFromName(tuple2.Item4);
+			if (normalizedFamily != PortFamilyUnknown && moduleFamily2 != normalizedFamily && moduleFamily2 != PortFamilyUnknown)
+				continue;
+			if (requiredSpeed > 0f)
+			{
+				float over = tuple2.Item2 - requiredSpeed;
+				if (over >= -0.01f && (fallbackIdx < 0 || over < fallbackOver))
+				{
+					fallbackOver = over;
+					fallbackIdx = tuple2.Item3;
+				}
+			}
+			else if (tuple2.Item2 > num2)
+			{
+				num2 = tuple2.Item2;
+				fallbackIdx = tuple2.Item3;
+			}
+		}
+		if (fallbackIdx >= 0)
+			return fallbackIdx;
+
 		if (list.Count == 0)
 		{
 			return -1;
 		}
-		string text = ((requiredSpeed >= 35f) ? "qsfp" : ((!(requiredSpeed >= 20f)) ? "sfp+" : "sfp28"));
-		int num5 = -1;
+		string text = (normalizedFamily != PortFamilyUnknown)
+			? normalizedFamily
+			: ((requiredSpeed >= 35f) ? PortFamilyQsfp : PortFamilySfp);
 		int num6 = -1;
 		int num7 = -1;
-		for (int j = 0; j < list.Count; j++)
+		for (int k = 0; k < list.Count; k++)
 		{
-			(int, float, int, string) tuple2 = list[j];
-			string text2 = (tuple2.Item4 ?? "").ToLowerInvariant();
-			if (text2.Contains("qsfp"))
+			(int, float, int, string) tuple3 = list[k];
+			string text2 = (tuple3.Item4 ?? "").ToLowerInvariant();
+			if (text2.Contains("qsfp") && num6 < 0)
 			{
-				if (num5 < 0)
-				{
-					num5 = tuple2.Item3;
-				}
-			}
-			else if (text2.Contains("sfp28") || text2.Contains("sfp_28"))
-			{
-				if (num6 < 0)
-				{
-					num6 = tuple2.Item3;
-				}
+				num6 = tuple3.Item3;
 			}
 			else if (text2.Contains("sfp") && num7 < 0)
 			{
-				num7 = tuple2.Item3;
+				num7 = tuple3.Item3;
 			}
 		}
-		if (text == "qsfp" && num5 >= 0)
-		{
-			return num5;
-		}
-		if (text == "sfp28" && num6 >= 0)
+		if (text == PortFamilyQsfp && num6 >= 0)
 		{
 			return num6;
-		}
-		if (text == "sfp+" && num7 >= 0)
-		{
-			return num7;
-		}
-		if (text == "qsfp")
-		{
-			return (num5 >= 0) ? num5 : ((num6 >= 0) ? num6 : num7);
 		}
 		if (num7 >= 0)
 		{
 			return num7;
 		}
-		if (num6 >= 0)
+		if (text == PortFamilyQsfp)
 		{
 			return num6;
 		}
@@ -3180,7 +4909,8 @@ public class RackBuilderCore : MelonMod
 				dictionary[key2] = 10f;
 			}
 		}
-		((MelonBase)this).LoggerInstance.Msg($"  Switch {((UnityEngine.Object)((Component)sw).gameObject).name} (type {sw.switchType}) port-type ? speed map: {string.Join(", ", dictionary.Select((KeyValuePair<int, float> kv) => $"{kv.Key}?{kv.Value}"))}");
+		if (_enableVerboseDiagnostics)
+			((MelonBase)this).LoggerInstance.Msg($"  Switch {((UnityEngine.Object)((Component)sw).gameObject).name} (type {sw.switchType}) port-type ? speed map: {string.Join(", ", dictionary.Select((KeyValuePair<int, float> kv) => $"{kv.Key}?{kv.Value}"))}");
 		_switchTypeSpeedMap[sw] = dictionary;
 		return dictionary;
 	}
@@ -3238,25 +4968,58 @@ public class RackBuilderCore : MelonMod
 				{
 					continue;
 				}
+				string portFamily = GetPortFamily(item2);
+				int selectedPrefabIdx = GetAutoFillChoiceForSwitch(val2, portFamily);
+				bool hasOverride = GetAutoFillOverridesForFamily(portFamily).ContainsKey(((UnityEngine.Object)(object)val2).GetInstanceID());
 				int sfpTypeSupported = item2.sfpTypeSupported;
 				float num4 = DeriveExpectedPortSpeed(val2, num3, item2);
 				try
 				{
-					int prefabIdx = FindBestSfpPrefab(list, sfpTypeSupported, num4);
+					int prefabIdx;
+					float selectedSpeed = 0f;
+					if (selectedPrefabIdx >= 0)
+					{
+						if (!TryGetSfpPrefabInfo(list, selectedPrefabIdx, out var selectedType, out selectedSpeed, out var selectedName, out var selectedFamily))
+						{
+							((MelonBase)this).LoggerInstance.Warning($"  Selected module prefab index {selectedPrefabIdx} no longer exists, falling back to AUTO");
+							prefabIdx = FindBestSfpPrefab(list, sfpTypeSupported, num4, portFamily);
+						}
+						else if (selectedType != sfpTypeSupported)
+						{
+							((MelonBase)this).LoggerInstance.Warning($"  Skipping {((UnityEngine.Object)((Component)val2).gameObject).name}[#{num3}] - selected module {selectedName} type={selectedType} incompatible with port type={sfpTypeSupported}");
+							num2++;
+							continue;
+						}
+						else if (!IsModuleFamilyCompatibleWithPort(selectedFamily, portFamily))
+						{
+							((MelonBase)this).LoggerInstance.Warning($"  Skipping {((UnityEngine.Object)((Component)val2).gameObject).name}[#{num3}] - selected module {selectedName} family={selectedFamily} incompatible with port family={portFamily}");
+							num2++;
+							continue;
+						}
+						else
+						{
+							prefabIdx = selectedPrefabIdx;
+						}
+					}
+					else
+					{
+						prefabIdx = FindBestSfpPrefab(list, sfpTypeSupported, num4, portFamily);
+					}
 					if (prefabIdx < 0)
 					{
-						((MelonBase)this).LoggerInstance.Warning($"  No SFP prefab for type={sfpTypeSupported} speed={num4}");
+						((MelonBase)this).LoggerInstance.Warning($"  No SFP prefab for type={sfpTypeSupported} speed={num4} family={portFamily}");
 						num2++;
 						continue;
 					}
 					GameObject val3 = ((Il2CppArrayBase<GameObject>)(object)val.sfpPrefabs)[prefabIdx];
-					float targetSpeed = num4;
+					float targetSpeed = ((selectedPrefabIdx >= 0 && selectedSpeed > 0f) ? selectedSpeed : num4);
 					string prefabName = ((UnityEngine.Object)val3).name.ToLowerInvariant();
 					if (prefabName.Contains("rj45") && (targetSpeed <= 0f || targetSpeed > 10f))
 						targetSpeed = 10f;
 					if (_enableVerboseDiagnostics)
 					{
-						((MelonBase)this).LoggerInstance.Msg($"  Port {((UnityEngine.Object)((Component)val2).gameObject).name}[#{num3}] switchType={val2.switchType} portConnSpeed={item2.connectionSpeed} ? need speed={targetSpeed} ? prefab[{prefabIdx}] {((UnityEngine.Object)val3).name} (speed={list.Find(((int sfpType, float speed, int prefabIdx, string name) x) => x.prefabIdx == prefabIdx).Item2})");
+						string selectorSource = hasOverride ? "switch override" : ((selectedPrefabIdx >= 0) ? "default selection" : "auto best-match");
+						((MelonBase)this).LoggerInstance.Msg($"  Port {((UnityEngine.Object)((Component)val2).gameObject).name}[#{num3}] family={portFamily} switchType={val2.switchType} portConnSpeed={item2.connectionSpeed} ? target speed={targetSpeed} ? prefab[{prefabIdx}] {((UnityEngine.Object)val3).name} via {selectorSource}");
 					}
 					GameObject val4 = UnityEngine.Object.Instantiate<GameObject>(val3, val.parentUsableObjects);
 					SFPModule val5 = val4.GetComponent<SFPModule>() ?? val4.GetComponentInChildren<SFPModule>();
@@ -3341,7 +5104,7 @@ public class RackBuilderCore : MelonMod
 				}
 			}
 		}
-		if (ghostsCleared > 0)
+		if (_enableVerboseDiagnostics && ghostsCleared > 0)
 			((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack] Cleared {ghostsCleared} ghost server port cable IDs before wiring");
 
 		List<CableLink> list = new List<CableLink>();
@@ -3362,7 +5125,8 @@ public class RackBuilderCore : MelonMod
 			}
 			if (flag)
 			{
-				((MelonBase)this).LoggerInstance.Msg("  Skipping already-wired server " + ((UnityEngine.Object)((Component)componentInChildren).gameObject).name);
+				if (_enableVerboseDiagnostics)
+					((MelonBase)this).LoggerInstance.Msg("  Skipping already-wired server " + ((UnityEngine.Object)((Component)componentInChildren).gameObject).name);
 				continue;
 			}
 			foreach (CableLink item3 in (Il2CppArrayBase<CableLink>)(object)componentInChildren.cablelinks)
@@ -3441,8 +5205,11 @@ public class RackBuilderCore : MelonMod
 
 		Dictionary<int, int> switchUsage = new Dictionary<int, int>();
 		((MelonBase)this).LoggerInstance.Msg($"Auto-wire: {list.Count} server ports, {list2.Count} switch ports");
-		((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack] PP order (A→B by Y): [{string.Join(", ", patchPanelOrder.Select((int id) => $"{id}(y={( panelYPos.TryGetValue(id, out float py) ? py.ToString("F1") : "?")})") )}]");
-		((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack] SW order (A→B by Y): [{string.Join(", ", orderedSwitchIds.Select((int id) => $"{id}(y={( switchYPos.TryGetValue(id, out float sy) ? sy.ToString("F1") : "?")})") )}]");
+		if (_enableVerboseDiagnostics)
+		{
+			((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack] PP order (A→B by Y): [{string.Join(", ", patchPanelOrder.Select((int id) => $"{id}(y={( panelYPos.TryGetValue(id, out float py) ? py.ToString("F1") : "?")})") )}]");
+			((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack] SW order (A→B by Y): [{string.Join(", ", orderedSwitchIds.Select((int id) => $"{id}(y={( switchYPos.TryGetValue(id, out float sy) ? sy.ToString("F1") : "?")})") )}]");
+		}
 		int num = 0;
 		foreach (CableLink item6 in list)
 		{
@@ -3451,7 +5218,8 @@ public class RackBuilderCore : MelonMod
 			int preferredGroup = (serverPortIndex >= 0) ? (serverPortIndex % 2) : 0; // 0=A, 1=B
 			int preferredPanelId = (patchPanelOrder.Count > 0 && serverPortIndex >= 0) ? patchPanelOrder[serverPortIndex % patchPanelOrder.Count] : 0;
 			string srvName = (((UnityEngine.Object)(object)item6.parentServer != (UnityEngine.Object)null) ? ((UnityEngine.Object)((Component)item6.parentServer).gameObject).name : "?");
-			((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack][Port] srv={srvName} portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup == 0 ? "A" : "B")}) preferredPanel={preferredPanelId} patchPanelOrder.Count={patchPanelOrder.Count} orderedSwitchIds.Count={orderedSwitchIds.Count}");
+			if (_enableVerboseDiagnostics)
+				((MelonBase)this).LoggerInstance.Msg($"[AutoWireRack][Port] srv={srvName} portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup == 0 ? "A" : "B")}) preferredPanel={preferredPanelId} patchPanelOrder.Count={patchPanelOrder.Count} orderedSwitchIds.Count={orderedSwitchIds.Count}");
 			for (int pass = 0; pass < 2 && !routedViaPatchPanel; pass++)
 			{
 				int bestPatchIndex = -1;
@@ -3552,7 +5320,8 @@ public class RackBuilderCore : MelonMod
 						if (swId != 0)
 							switchUsage[swId] = switchUsage.TryGetValue(swId, out int used) ? used + 1 : 1;
 						int swIdx = orderedSwitchIds.IndexOf(swId);
-						((MelonBase)this).LoggerInstance.Msg($"  Wired server via patch panel: portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup==0?"A":"B")}) panel={bestPair.panelId} swId={swId} swIdx={swIdx}(={( swIdx>=0?(swIdx%2==0?"A":"B"):"?")})");
+						if (_enableVerboseDiagnostics)
+							((MelonBase)this).LoggerInstance.Msg($"  Wired server via patch panel: portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup==0?"A":"B")}) panel={bestPair.panelId} swId={swId} swIdx={swIdx}(={( swIdx>=0?(swIdx%2==0?"A":"B"):"?")})");
 						break;
 					}
 				}
@@ -3608,7 +5377,8 @@ public class RackBuilderCore : MelonMod
 				}
 				if ((UnityEngine.Object)(object)val3 == (UnityEngine.Object)null)
 				{
-					((MelonBase)this).LoggerInstance.Msg($"  No compatible switch port for server port (fibre={item6.isFibrePort}, sfp={item6.isSFPPort}, type={item6.sfpTypeSupported})");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  No compatible switch port for server port (fibre={item6.isFibrePort}, sfp={item6.isSFPPort}, type={item6.sfpTypeSupported})");
 					continue;
 				}
 			}
@@ -3623,7 +5393,8 @@ public class RackBuilderCore : MelonMod
 					if (swId2 != 0)
 						switchUsage[swId2] = switchUsage.TryGetValue(swId2, out int used2) ? used2 + 1 : 1;
 					int swIdx2 = orderedSwitchIds.IndexOf(swId2);
-					((MelonBase)this).LoggerInstance.Msg($"  Wired switch->server (direct): portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup==0?"A":"B")}) swId={swId2} swIdx={swIdx2}(={(swIdx2>=0?(swIdx2%2==0?"A":"B"):"?")})");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  Wired switch->server (direct): portIdx={serverPortIndex} group={preferredGroup}({(preferredGroup==0?"A":"B")}) swId={swId2} swIdx={swIdx2}(={(swIdx2>=0?(swIdx2%2==0?"A":"B"):"?")})");
 				}
 			}
 			catch (Exception ex)
@@ -4110,7 +5881,8 @@ public class RackBuilderCore : MelonMod
 					}
 				}
 			}
-			((MelonBase)this).LoggerInstance.Msg($"Pre-occupied slot count: {hashSet.Count}");
+			if (_enableVerboseDiagnostics)
+				((MelonBase)this).LoggerInstance.Msg($"Pre-occupied slot count: {hashSet.Count}");
 		}
 		foreach (int item2 in list)
 		{
@@ -4145,7 +5917,8 @@ public class RackBuilderCore : MelonMod
 				{
 					val.lastUsedRackPositionGlobalUID++;
 					val4.rackPosGlobalUID = val.lastUsedRackPositionGlobalUID;
-					((MelonBase)this).LoggerInstance.Msg($"  Assigned missing UID {val4.rackPosGlobalUID} to RackPosition slot {num15}");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  Assigned missing UID {val4.rackPosGlobalUID} to RackPosition slot {num15}");
 				}
 				try
 				{
@@ -4188,7 +5961,7 @@ public class RackBuilderCore : MelonMod
 							// Do not touch global CablePositions here; IDs on prefabs can collide with live cables.
 							cl.cableIDsOnLink = -1;
 						}
-						if (clearedPrefabLinks > 0)
+						if (_enableVerboseDiagnostics && clearedPrefabLinks > 0)
 						{
 							((MelonBase)this).LoggerInstance.Msg($"  Cleared inherited cable state on {clearedPrefabLinks} links ({itemChoice.category})");
 						}
@@ -4200,7 +5973,8 @@ public class RackBuilderCore : MelonMod
 					{
 						val8 = component.secondPosition;
 						localRotation = Quaternion.Euler(component.secondRotation);
-						((MelonBase)this).LoggerInstance.Msg($"  {itemChoice.name} secondPos={val8} secondRot={component.secondRotation} pivotPos={component.offsetPivotPosition}");
+						if (_enableVerboseDiagnostics)
+							((MelonBase)this).LoggerInstance.Msg($"  {itemChoice.name} secondPos={val8} secondRot={component.secondRotation} pivotPos={component.offsetPivotPosition}");
 					}
 					// Parent under the RackPosition, then apply local offset from prefab.
 					val7.transform.SetParent(((Component)val4).transform);
@@ -4303,10 +6077,12 @@ public class RackBuilderCore : MelonMod
 							ssd.timeToBrake = timeToBrake;
 							ssd.eolTime = eolTime;
 							try { component4.Start(); } catch { }
-							((MelonBase)this).LoggerInstance.Msg("Called Server.Start() before ServerInsertedInRack");
+							if (_enableVerboseDiagnostics)
+								((MelonBase)this).LoggerInstance.Msg("Called Server.Start() before ServerInsertedInRack");
 							LogPlacementDebugState("before-server-insert", component4, null);
 							component4.ServerInsertedInRack(ssd);
-							((MelonBase)this).LoggerInstance.Msg("Called ServerInsertedInRack");
+							if (_enableVerboseDiagnostics)
+								((MelonBase)this).LoggerInstance.Msg("Called ServerInsertedInRack");
 							LogPlacementDebugState("after-server-insert", component4, null);
 							component4.isOn = false;
 							if (component4.activeLinks != null)
@@ -4337,7 +6113,8 @@ public class RackBuilderCore : MelonMod
 							swsd.eolTime = eolTime2;
 							LogPlacementDebugState("before-switch-insert", null, component5);
 							component5.SwitchInsertedInRack(swsd);
-							((MelonBase)this).LoggerInstance.Msg("Called SwitchInsertedInRack");
+							if (_enableVerboseDiagnostics)
+								((MelonBase)this).LoggerInstance.Msg("Called SwitchInsertedInRack");
 							LogPlacementDebugState("after-switch-insert", null, component5);
 							component5.isOn = false;
 							// Zero out stale prefab speeds on empty SFP ports immediately after insert.
@@ -4378,19 +6155,22 @@ public class RackBuilderCore : MelonMod
 						if ((UnityEngine.Object)(object)component4 != (UnityEngine.Object)null)
 						{
 							value = component4.ValidateRackPosition();
-							((MelonBase)this).LoggerInstance.Msg($"  ValidateRackPosition({itemChoice.name}) => {value}");
+							if (_enableVerboseDiagnostics)
+								((MelonBase)this).LoggerInstance.Msg($"  ValidateRackPosition({itemChoice.name}) => {value}");
 							LogPlacementDebugState("after-server-validate", component4, null);
 						}
 						else if ((UnityEngine.Object)(object)component5 != (UnityEngine.Object)null)
 						{
 							value = component5.ValidateRackPosition();
-							((MelonBase)this).LoggerInstance.Msg($"  ValidateRackPosition({itemChoice.name}) => {value}");
+							if (_enableVerboseDiagnostics)
+								((MelonBase)this).LoggerInstance.Msg($"  ValidateRackPosition({itemChoice.name}) => {value}");
 							LogPlacementDebugState("after-switch-validate", null, component5);
 						}
 						else if ((UnityEngine.Object)(object)component6 != (UnityEngine.Object)null)
 						{
 							value = component6.ValidateRackPosition();
-							((MelonBase)this).LoggerInstance.Msg($"  ValidateRackPosition({itemChoice.name}) => {value}");
+							if (_enableVerboseDiagnostics)
+								((MelonBase)this).LoggerInstance.Msg($"  ValidateRackPosition({itemChoice.name}) => {value}");
 						}
 					}
 					catch (Exception ex2)
@@ -4405,7 +6185,8 @@ public class RackBuilderCore : MelonMod
 						hashSet.Add(num13 + num16);
 					}
 					num2++;
-					((MelonBase)this).LoggerInstance.Msg($"Placed {itemChoice.name} at U{num13 + 1}");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"Placed {itemChoice.name} at U{num13 + 1}");
 					break;
 				}
 				catch (Exception ex3)
@@ -4624,6 +6405,138 @@ public class RackBuilderCore : MelonMod
 		return result;
 	}
 
+	private int RemoveCableIdEverywhere(int cableId, CablePositions cablePositions)
+	{
+		if (cableId <= 0)
+		{
+			return 0;
+		}
+		try
+		{
+			if ((UnityEngine.Object)(object)cablePositions != (UnityEngine.Object)null)
+			{
+				cablePositions.RemovePosition(cableId);
+			}
+		}
+		catch
+		{
+		}
+		int cleared = 0;
+		foreach (CableLink link in UnityEngine.Object.FindObjectsOfType<CableLink>())
+		{
+			if ((UnityEngine.Object)(object)link == (UnityEngine.Object)null || link.cableIDsOnLink != cableId)
+			{
+				continue;
+			}
+			link.cableIDsOnLink = -1;
+			link.connectionSpeed = 0f;
+			cleared++;
+		}
+		return cleared;
+	}
+
+	private void ReconcileSelectedRackUsageState()
+	{
+		if ((UnityEngine.Object)(object)_selectedRack == (UnityEngine.Object)null || _selectedRack.positions == null)
+		{
+			return;
+		}
+		int slotCount = ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions).Length;
+		if (slotCount <= 0)
+		{
+			return;
+		}
+		Dictionary<int, int> rpInstanceToSlot = new Dictionary<int, int>();
+		Dictionary<int, int> rpUidToSlot = new Dictionary<int, int>();
+		for (int i = 0; i < slotCount; i++)
+		{
+			RackPosition rp = ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions)[i];
+			if ((UnityEngine.Object)(object)rp == (UnityEngine.Object)null)
+			{
+				continue;
+			}
+			rpInstanceToSlot[((Component)rp).gameObject.GetInstanceID()] = i;
+			if (rp.rackPosGlobalUID > 0)
+			{
+				rpUidToSlot[rp.rackPosGlobalUID] = i;
+			}
+		}
+		bool topIsHigh = false;
+		if (slotCount >= 2)
+		{
+			RackPosition rpA = ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions)[0];
+			RackPosition rpB = ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions)[slotCount - 1];
+			if ((UnityEngine.Object)(object)rpA != (UnityEngine.Object)null && (UnityEngine.Object)(object)rpB != (UnityEngine.Object)null)
+			{
+				topIsHigh = ((Component)rpB).transform.position.y > ((Component)rpA).transform.position.y;
+			}
+		}
+		bool[] used = new bool[slotCount];
+		bool hasPendingRemovals = _pendingRemovalUsableIds.Count > 0;
+		foreach (UsableObject uo in CollectRackUsableObjects())
+		{
+			if ((UnityEngine.Object)(object)uo == (UnityEngine.Object)null)
+			{
+				continue;
+			}
+			if (hasPendingRemovals && _pendingRemovalUsableIds.Contains(((UnityEngine.Object)(object)uo).GetInstanceID()))
+			{
+				continue;
+			}
+			if ((UnityEngine.Object)(object)((Component)uo).GetComponent<SFPModule>() != (UnityEngine.Object)null)
+			{
+				continue;
+			}
+			int anchor = -1;
+			if ((UnityEngine.Object)(object)uo.currentRackPosition != (UnityEngine.Object)null)
+			{
+				rpInstanceToSlot.TryGetValue(((Component)uo.currentRackPosition).gameObject.GetInstanceID(), out anchor);
+			}
+			if (anchor < 0 && uo.rackPositionUID > 0)
+			{
+				rpUidToSlot.TryGetValue(uo.rackPositionUID, out anchor);
+			}
+			if (anchor < 0)
+			{
+				anchor = uo.storedPosition;
+			}
+			if (anchor < 0 || anchor >= slotCount)
+			{
+				continue;
+			}
+			int size = (uo.sizeInU > 0) ? uo.sizeInU : 1;
+			int start = topIsHigh ? (anchor - size + 1) : anchor;
+			if (start < 0)
+			{
+				start = 0;
+			}
+			int endExclusive = Mathf.Min(slotCount, start + size);
+			for (int slot = start; slot < endExclusive; slot++)
+			{
+				used[slot] = true;
+			}
+		}
+		for (int i = 0; i < slotCount; i++)
+		{
+			bool isUsed = used[i];
+			if (_selectedRack.isPositionUsed != null && i < ((Il2CppArrayBase<int>)(object)_selectedRack.isPositionUsed).Length)
+			{
+				((Il2CppArrayBase<int>)(object)_selectedRack.isPositionUsed)[i] = isUsed ? 1 : 0;
+			}
+			RackPosition rp = ((Il2CppArrayBase<RackPosition>)(object)_selectedRack.positions)[i];
+			if ((UnityEngine.Object)(object)rp != (UnityEngine.Object)null)
+			{
+				try
+				{
+					rp.SetUsed(isUsed);
+				}
+				catch
+				{
+				}
+			}
+		}
+	}
+
 	private void RemoveItemByAnchor(int anchorIdx, int size)
 	{
 		//IL_01b9: Unknown result type (might be due to invalid IL or missing references)
@@ -4678,6 +6591,10 @@ public class RackBuilderCore : MelonMod
 				break;
 			}
 		}
+		if ((UnityEngine.Object)(object)val2 == (UnityEngine.Object)null)
+		{
+			return;
+		}
 		if (size <= 0)
 		{
 			size = ((val2.sizeInU <= 0) ? 1 : val2.sizeInU);
@@ -4702,41 +6619,21 @@ public class RackBuilderCore : MelonMod
 		try
 		{
 			CablePositions val3 = GetCablePositionsCached();
-			Server component = ((Component)val2).GetComponent<Server>();
-			NetworkSwitch component2 = ((Component)val2).GetComponent<NetworkSwitch>();
-			CableLink[] array = null;
-			if ((UnityEngine.Object)(object)component != (UnityEngine.Object)null && component.cablelinks != null)
+			HashSet<int> cableIds = new HashSet<int>();
+			foreach (CableLink val4 in ((Component)val2).GetComponentsInChildren<CableLink>(true))
 			{
-				Il2CppArrayBase<CableLink> _tmp1 = (Il2CppArrayBase<CableLink>)(object)component.cablelinks;
-				array = _tmp1;
-			}
-			else if ((UnityEngine.Object)(object)component2 != (UnityEngine.Object)null && component2.cableLinkSwitchPorts != null)
-			{
-				Il2CppArrayBase<CableLink> _tmp2 = (Il2CppArrayBase<CableLink>)(object)component2.cableLinkSwitchPorts;
-				array = _tmp2;
-			}
-			if (array != null && (UnityEngine.Object)(object)val3 != (UnityEngine.Object)null)
-			{
-				CableLink[] array2 = array;
-				foreach (CableLink val4 in array2)
+				if ((UnityEngine.Object)(object)val4 == (UnityEngine.Object)null)
 				{
-					if ((UnityEngine.Object)(object)val4 == (UnityEngine.Object)null)
-					{
-						continue;
-					}
-					int cableIDsOnLink = val4.cableIDsOnLink;
-					if (cableIDsOnLink > 0)
-					{
-						try
-						{
-							val3.RemovePosition(cableIDsOnLink);
-						}
-						catch
-						{
-						}
-						val4.cableIDsOnLink = -1;
-					}
+					continue;
 				}
+				if (val4.cableIDsOnLink > 0)
+				{
+					cableIds.Add(val4.cableIDsOnLink);
+				}
+			}
+			foreach (int cableId in cableIds)
+			{
+				RemoveCableIdEverywhere(cableId, val3);
 			}
 		}
 		catch (Exception ex)
@@ -4769,9 +6666,13 @@ public class RackBuilderCore : MelonMod
 				}
 			}
 		}
+		_pendingRemovalUsableIds.Add(((UnityEngine.Object)(object)val2).GetInstanceID());
 		UnityEngine.Object.Destroy((UnityEngine.Object)(object)((Component)val2).gameObject);
 		// Item destroyed — invalidate UsableObject cache so next ShowRackDetail reflects the change.
 		_cachedUsableObjectsTime = -999f;
+		_cachedServersTime = -999f;
+		_cachedNetworkSwitchesTime = -999f;
+		_cachedPatchPanelsTime = -999f;
 		((MelonBase)this).LoggerInstance.Msg($"Removed {((UnityEngine.Object)((Component)val2).gameObject).name} — anchor U{anchorIdx + 1}, range U{num + 1}–U{num + size} ({size}U)");
 	}
 
@@ -4834,6 +6735,12 @@ public class RackBuilderCore : MelonMod
 				((MelonBase)this).LoggerInstance.Warning($"Bulk remove skipped anchor U{entry.anchor + 1}: {ex.Message}");
 			}
 		}
+		ReconcileSelectedRackUsageState();
+		SanitizeGhostCableIDs();
+		_cachedUsableObjectsTime = -999f;
+		_cachedServersTime = -999f;
+		_cachedNetworkSwitchesTime = -999f;
+		_cachedPatchPanelsTime = -999f;
 		return removed;
 	}
 
@@ -4957,7 +6864,8 @@ public class RackBuilderCore : MelonMod
 						prefabIndex = i,
 						sizeInU = num
 					});
-					((MelonBase)this).LoggerInstance.Msg($"  Server type {i}: {text} ({num}U)");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  Server type {i}: {text} ({num}U)");
 				}
 			}
 		}
@@ -4987,7 +6895,8 @@ public class RackBuilderCore : MelonMod
 						prefabIndex = j,
 						sizeInU = num2
 					});
-					((MelonBase)this).LoggerInstance.Msg($"  Switch type {j}: {text2} ({num2}U)");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  Switch type {j}: {text2} ({num2}U)");
 				}
 			}
 		}
@@ -5008,7 +6917,8 @@ public class RackBuilderCore : MelonMod
 						prefabIndex = k,
 						sizeInU = num3
 					});
-					((MelonBase)this).LoggerInstance.Msg($"  PatchPanel type {k}: {text3} ({num3}U)");
+					if (_enableVerboseDiagnostics)
+						((MelonBase)this).LoggerInstance.Msg($"  PatchPanel type {k}: {text3} ({num3}U)");
 				}
 			}
 		}
@@ -5443,8 +7353,49 @@ public class RackBuilderCore : MelonMod
 		return result;
 	}
 
+	[HarmonyPatch(typeof(GameObject), nameof(GameObject.SetActive), new Type[] { typeof(bool) })]
+	private static class GameObjectSetActiveModalGuardPatch
+	{
+		private static bool IsSameOrAncestor(GameObject maybeAncestor, GameObject child)
+		{
+			if ((UnityEngine.Object)(object)maybeAncestor == (UnityEngine.Object)null || (UnityEngine.Object)(object)child == (UnityEngine.Object)null)
+				return false;
+			if ((UnityEngine.Object)(object)maybeAncestor == (UnityEngine.Object)(object)child)
+				return true;
+			return child.transform.IsChildOf(maybeAncestor.transform);
+		}
+
+		private static bool Prefix(GameObject __instance, bool value)
+		{
+			if (_instance == null || !_instance._profileNameDialogShouldRemainOpen || (UnityEngine.Object)(object)__instance == (UnityEngine.Object)null)
+				return true;
+
+			if (!value && IsSameOrAncestor(__instance, _instance._rackScreen))
+				return false;
+
+			if (value && (UnityEngine.Object)(object)_instance._shop != (UnityEngine.Object)null
+				&& (UnityEngine.Object)(object)_instance._shop.mainScreen != (UnityEngine.Object)null
+				&& IsSameOrAncestor(__instance, _instance._shop.mainScreen))
+				return false;
+
+			return true;
+		}
+	}
+
 	public override void OnDeinitializeMelon()
 	{
+		_pendingRemovalUsableIds.Clear();
+		_profileNameDialogShouldRemainOpen = false;
+		SetProfileDialogInputIsolation(false);
+		try
+		{
+			((MelonBase)this).HarmonyInstance.UnpatchSelf();
+		}
+		catch
+		{
+		}
+		if (ReferenceEquals(_instance, this))
+			_instance = null;
 		((MelonBase)this).LoggerInstance.Msg("Rack Builder Mod unloaded.");
 	}
 }
